@@ -36,7 +36,7 @@ export type PlanNode = { retries: number; retryDelay: string };
  * only what the code between steps needs.
  */
 export type RunPlan =
-  | { ok: true; graph: Graph; triggerId: string | null; nodes: Record<string, PlanNode> }
+  | { ok: true; graph: Graph; triggerId: string | null; nodes: Record<string, PlanNode>; info: { workspaceId: string; workflowId: string; no: number } }
   | { ok: false; error: StoredError };
 
 export type NodeCall = {
@@ -93,7 +93,7 @@ export async function loadRun(sql: Sql, runId: string): Promise<RunPlan> {
       update runs set status = 'running', started_at = coalesce(started_at, now())
       where id = ${runId} and status = 'queued'
     )
-    select wv.definition, r.trigger_id
+    select wv.definition, r.trigger_id, r.workspace_id, r.workflow_id, r.no
     from runs r join workflow_versions wv on wv.id = r.workflow_version_id
     where r.id = ${runId}`;
   if (!run) return { ok: false, error: { code: "RUN_NOT_FOUND", message: `Run ${runId} does not exist.` } };
@@ -130,7 +130,7 @@ export async function loadRun(sql: Sql, runId: string): Promise<RunPlan> {
     const attempts = node.data.settings.maxAttempts ?? version.retry_max_attempts;
     nodes[node.id] = { retries: Math.max(0, attempts - 1) + INFRA_RETRIES, retryDelay: retryDelay(version.retry_backoff, version.retry_base_delay_ms) };
   }
-  return { ok: true, graph, triggerId: run.trigger_id ?? null, nodes };
+  return { ok: true, graph, triggerId: run.trigger_id ?? null, nodes, info: { workspaceId: run.workspace_id, workflowId: run.workflow_id, no: Number(run.no) } };
 }
 
 // ---------------------------------------------------------------------------

@@ -148,3 +148,7 @@ Xem `../README.md`. Tóm tắt: chép `.dev.vars.example` thành `.dev.vars`, đ
 ```bash
 npm run dev
 ```
+
+## Realtime (tùy chọn)
+
+Runner ghi trạng thái run và node run lên Firebase Realtime Database qua REST để giao diện cập nhật không cần tải lại. Cần ba secret, cùng giá trị với app: `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY`, `FIREBASE_DATABASE_URL` (`npx wrangler secret put <TÊN>`). Thiếu thì runner bỏ qua việc ghi; ghi lỗi chỉ để lại một dòng log và không làm hỏng step vì Postgres là nguồn chính. Đường dẫn và rule: `xaas-workflows/.ai/rtdb-rules.md`.
