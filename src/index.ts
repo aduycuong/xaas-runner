@@ -74,9 +74,19 @@ app.get("/nodes/:script/health", async (c) => {
  * on every call: no database reads, no clock, only step results.
  *
  * Step names and their order are a contract with runs in flight. A change to either needs a
- * new route (`/run/v2`), with this one kept until its runs have ended.
+ * new route (`/run/v3`), with this one kept until its runs have ended.
+ *
+ * v2 has fewer steps than v1: the `flow.if` nodes after a node are decided in that node's step and
+ * the last node step ends the run. A run is `load` plus one step per worker node; a `finish` step
+ * only follows when the run ends without a node step doing it (e.g. an invalid graph).
  */
-app.post("/run/v1", (c) => {
+app.post("/run/v2", async (c, next) => {
+  // The Upstash SDK answers an unsigned call with a 500 and a stack trace; refuse it plainly first.
+  if (!c.req.header("upstash-signature")) return c.json({ error: "missing_signature" }, 401);
+  await next();
+});
+
+app.post("/run/v2", (c) => {
   const sql = neon(c.env.DATABASE_URL);
   const callNode = createCallNode(c.env as unknown as Record<string, unknown>);
 
@@ -86,11 +96,10 @@ app.post("/run/v1", (c) => {
 
       const plan = await context.run("load", () => loadRunPlan(sql, runId));
 
-      let status: "succeeded" | "failed" = "succeeded";
+      let finished = false;
       let error: StoredError | undefined;
 
       if (!plan.ok) {
-        status = "failed";
         error = plan.error;
       } else {
         const visited = new Set<string>();
@@ -101,7 +110,6 @@ app.post("/run/v1", (c) => {
           const settings: PlanNode | undefined = plan.nodes[nodeId];
           if (!settings || visited.has(nodeId)) {
             // A step name may be used once per run, so a graph that loops cannot go on.
-            status = "failed";
             error = { code: "INVALID_GRAPH", message: `Node "${nodeId}" is unknown or was reached twice.` };
             break;
           }
@@ -112,16 +120,15 @@ app.post("/run/v1", (c) => {
             () => executeNode(sql, runId, nodeId, callNode),
             settings,
           );
-          if (result.status === "failed") {
-            status = "failed";
-            error = result.error;
+          if (result.finished) {
+            finished = true;
             break;
           }
           cursor = result.next;
         }
       }
 
-      await context.run("finish", () => finishRun(sql, runId, status, error));
+      if (!finished) await context.run("finish", () => finishRun(sql, runId, "failed", error));
     },
     {
       // Reached only when Upstash runs out of retries, i.e. for failures around the nodes.

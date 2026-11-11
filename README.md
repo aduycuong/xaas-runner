@@ -1,10 +1,10 @@
 # xaas-runner
 
-Worker chạy các run của XaaS Workflows. Upstash Workflow gọi `POST /run/v1` một lần cho mỗi step; runner đọc workflow từ database, gọi node qua service binding và ghi kết quả. Kiến trúc: `xaas-workflows/docs/kien-truc-upstash-cloudflare-hono.md`.
+Worker chạy các run của XaaS Workflows. Upstash Workflow gọi `POST /run/v2` một lần cho mỗi step; runner đọc workflow từ database, gọi node qua service binding và ghi kết quả. Kiến trúc: `xaas-workflows/docs/kien-truc-upstash-cloudflare-hono.md`.
 
 | Route | Ai gọi | Xác thực |
 | --- | --- | --- |
-| `POST /run/v1` | Upstash Workflow | Chữ ký Upstash (signing keys) |
+| `POST /run/v2` | Upstash Workflow | Chữ ký Upstash (signing keys) |
 | `GET /nodes/<tên Worker>/health` | Script deploy node | Bearer `RUNNER_ADMIN_TOKEN` |
 | `GET /health` | Uptime monitor | Không |
 
@@ -119,7 +119,7 @@ npm run deploy
 Tên và thứ tự các step (`load`, `node:<id>`, `finish`) là giao kèo với những run đang chạy dở: một run đang chờ retry sẽ chạy tiếp bằng code mới nhưng dùng kết quả step cũ.
 
 - Được phép deploy thẳng: sửa logic bên trong một step, thêm route, thêm binding.
-- Đổi tên, bỏ hoặc đổi thứ tự step: thêm route mới (`/run/v2`), giữ `/run/v1` cho tới khi các run cũ chạy hết, và đổi `RUNNER_ROUTE` trong ingress.
+- Đổi tên, bỏ hoặc đổi thứ tự step: thêm route mới (`/run/v3`), giữ `/run/v2` cho tới khi các run cũ chạy hết, và đổi `RUNNER_ROUTE` trong ingress.
 
 ### Quay lại bản trước và xem log
 
