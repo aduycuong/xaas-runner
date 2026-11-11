@@ -12,7 +12,10 @@
   // To add a node: deploy the node Worker first, add its binding here, then deploy the runner.
   "services": [
     { "binding": "NODE_CORE_ECHO_V1_0_0", "service": "node-core-echo-v1-0-0" }
-  ]
+  ],
+  "vars": {
+    "QSTASH_URL": "https://qstash-us-east-1.upstash.io"
+  }
   // Secrets (wrangler secret put, or .dev.vars locally):
   //   DATABASE_URL, QSTASH_TOKEN, QSTASH_CURRENT_SIGNING_KEY, QSTASH_NEXT_SIGNING_KEY, RUNNER_ADMIN_TOKEN
 }
