@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "xaas-runner",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // Runs near the database instead of near the caller: each step does several queries.
+  "placement": { "mode": "smart" },
+  "observability": { "enabled": true },
+  // One binding per deployed node version. The binding name is the Worker name in upper case
+  // with every other character turned into "_" (bindingName in src/logic.ts).
+  // To add a node: deploy the node Worker first, add its binding here, then deploy the runner.
+  "services": [
+    { "binding": "NODE_CORE_ECHO_V1_0_0", "service": "node-core-echo-v1-0-0" }
+  ]
+  // Secrets (wrangler secret put, or .dev.vars locally):
+  //   DATABASE_URL, QSTASH_TOKEN, QSTASH_CURRENT_SIGNING_KEY, QSTASH_NEXT_SIGNING_KEY, RUNNER_ADMIN_TOKEN
+}
