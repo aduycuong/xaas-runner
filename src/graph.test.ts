@@ -88,6 +88,11 @@ test("validateGraph: schema errors and the unsupported merge mode", () => {
   assert.match(validateGraph(first).issues[0].message, /not supported yet/);
 });
 
+test("validateGraph: a disabled node cannot be published", () => {
+  const node = { ...action("a"), data: { ...action("a").data, disabled: true } };
+  assert.match(validateGraph({ nodes: [trigger(), node], edges: [edge("t", "a")] }).issues[0].message, /is disabled/);
+});
+
 test("expressions: paths, arrays, length, default, whole vs part", () => {
   assert.equal(resolveValue("{{ trigger.name }}", scope), "An");
   assert.equal(resolveValue("{{ nodes.a.output.items[1].price }}", scope), 20);

@@ -1,8 +1,9 @@
 import { neon } from "@neondatabase/serverless";
 import { serve, type WorkflowBindings } from "@upstash/workflow/hono";
 import { Hono } from "hono";
-import { executeNode, failRun, finishRun, loadRunPlan, type CallNode, type NodeStepResult, type PlanNode } from "./engine";
-import { bindingName, type StoredError } from "./logic";
+import { executeAction, failRun, finishWithSkips, loadRun, runBuiltIns, type CallNode } from "./engine";
+import { bindingName } from "./logic";
+import { orchestrate } from "./orchestrate";
 
 /** Secrets and vars. The service bindings to node Workers are read by name in `createCallNode`. */
 type Bindings = WorkflowBindings & {
@@ -70,65 +71,35 @@ app.get("/nodes/:script/health", async (c) => {
 
 /**
  * Runs one workflow run. Upstash calls this route once per step and the function below runs
- * again from the top each time, so everything outside `context.run` must give the same answer
- * on every call: no database reads, no clock, only step results.
+ * again from the top each time (see `orchestrate`).
  *
  * Step names and their order are a contract with runs in flight. A change to either needs a
- * new route (`/run/v3`), with this one kept until its runs have ended.
+ * new route (`/run/v4`), with this one kept until its runs have ended.
  *
- * v2 has fewer steps than v1: the `flow.if` nodes after a node are decided in that node's step and
- * the last node step ends the run. A run is `load` plus one step per worker node; a `finish` step
- * only follows when the run ends without a node step doing it (e.g. an invalid graph).
+ * v3 runs the workflow graph: `load`, then waves of `node:<id>` steps (parallel inside a wave),
+ * `flow:<n>` for if / switch / merge that need a step of their own, and `finish` when no node step
+ * ended the run.
  */
-app.post("/run/v2", async (c, next) => {
+app.post("/run/v3", async (c, next) => {
   // The Upstash SDK answers an unsigned call with a 500 and a stack trace; refuse it plainly first.
   if (!c.req.header("upstash-signature")) return c.json({ error: "missing_signature" }, 401);
   await next();
 });
 
-app.post("/run/v2", (c) => {
+app.post("/run/v3", (c) => {
   const sql = neon(c.env.DATABASE_URL);
   const callNode = createCallNode(c.env as unknown as Record<string, unknown>);
 
   const handler = serve<{ runId: string }, Bindings>(
     async (context) => {
       const { runId } = context.requestPayload;
-
-      const plan = await context.run("load", () => loadRunPlan(sql, runId));
-
-      let finished = false;
-      let error: StoredError | undefined;
-
-      if (!plan.ok) {
-        error = plan.error;
-      } else {
-        const visited = new Set<string>();
-        let cursor: string | null = plan.entry;
-
-        while (cursor) {
-          const nodeId: string = cursor;
-          const settings: PlanNode | undefined = plan.nodes[nodeId];
-          if (!settings || visited.has(nodeId)) {
-            // A step name may be used once per run, so a graph that loops cannot go on.
-            error = { code: "INVALID_GRAPH", message: `Node "${nodeId}" is unknown or was reached twice.` };
-            break;
-          }
-          visited.add(nodeId);
-
-          const result: NodeStepResult = await context.run(
-            `node:${nodeId}`,
-            () => executeNode(sql, runId, nodeId, callNode),
-            settings,
-          );
-          if (result.finished) {
-            finished = true;
-            break;
-          }
-          cursor = result.next;
-        }
-      }
-
-      if (!finished) await context.run("finish", () => finishRun(sql, runId, "failed", error));
+      const plan = await context.run("load", () => loadRun(sql, runId));
+      await orchestrate(plan, {
+        step: (name, fn, settings) => context.run(name, fn, settings),
+        executeAction: (nodeId, options) => executeAction(sql, runId, nodeId, callNode, options),
+        runBuiltIns: (wire, skips) => runBuiltIns(sql, runId, wire, skips),
+        finish: (status, skips, error) => finishWithSkips(sql, runId, status, skips, error),
+      });
     },
     {
       // Reached only when Upstash runs out of retries, i.e. for failures around the nodes.
