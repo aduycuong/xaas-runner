@@ -359,6 +359,9 @@ export function validateGraph(input: unknown): { graph: Graph | null; issues: Is
   if (triggers.length === 0) add(null, "nodes", "The workflow needs a trigger.");
 
   for (const node of graph.nodes) {
+    if (node.type === "action" && node.data.disabled) {
+      add(node.id, "nodes", `Node "${node.id}" is disabled: enable it or remove it before publishing.`);
+    }
     if (node.type === "merge") {
       if ((incoming.get(node.id) ?? []).length < 2) add(node.id, "nodes", `Merge "${node.id}" needs at least two incoming edges.`);
       if (node.data.mode === "first") add(node.id, "nodes", `Merge "${node.id}": "first to finish" is not supported yet.`);
