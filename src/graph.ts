@@ -1,8 +1,9 @@
 // Workflow graph: format, validation, expressions, conditions and scheduling. Pure: no I/O.
 //
-// This file is declared twice, byte for byte: here and in xaas-workflows/lib/workflows/graph.ts
-// (the app validates and previews with it, the runner runs with it). Change both together; the
-// tests (graph.test.ts) and their fixtures are copied the same way.
+// This file is declared three times, byte for byte: here, in xaas-workflows/lib/workflows/graph.ts
+// (the app validates and previews with it) and in xaas-ingress/src/graph.ts (webhook filters and
+// input mappings use its expressions and conditions). Change all together; the tests
+// (graph.test.ts) are copied to the app and the runner.
 
 import { z } from "zod";
 

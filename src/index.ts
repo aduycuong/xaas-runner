@@ -3,11 +3,14 @@ import { serve, type WorkflowBindings } from "@upstash/workflow/hono";
 import { Hono } from "hono";
 import { executeAction, failRun, finishWithSkips, loadRun, runBuiltIns, type CallNode } from "./engine";
 import { bindingName } from "./logic";
+import { publishRunFinished } from "./notify";
 import { orchestrate } from "./orchestrate";
 import { createRealtime, runEvents, type RtdbEnv } from "./rtdb";
 
 /** Secrets and vars. The service bindings to node Workers are read by name in `createCallNode`. */
 type Bindings = WorkflowBindings & RtdbEnv & {
+  /** Public URL of the ingress Worker; the runner tells it when a run ends. Optional. */
+  INGRESS_URL?: string;
   DATABASE_URL: string;
   /** Bearer token of `GET /nodes/:script/health`. The route answers 503 while it is not set. */
   RUNNER_ADMIN_TOKEN?: string;
@@ -102,7 +105,10 @@ app.post("/run/v3", (c) => {
         return loaded;
       });
       const events = plan.ok ? runEvents(rt, { runId, ...plan.info }) : null;
-      const endRun = (status: "succeeded" | "failed") => events?.runEnded(status);
+      const endRun = (status: "succeeded" | "failed") => {
+        events?.runEnded(status);
+        c.executionCtx.waitUntil(publishRunFinished(c.env, runId));
+      };
       const skipped = (ids: string[]) => ids.forEach((id) => events?.nodeEnded(id, "skipped"));
       const ended = (ends: { id: string; status: string }[]) => ends.forEach((end) => events?.nodeEnded(end.id, end.status));
 
@@ -135,6 +141,7 @@ app.post("/run/v3", (c) => {
       failureFunction: async ({ context, failStatus, failResponse }) => {
         const message = `${failStatus}: ${failResponse}`.slice(0, 500);
         await failRun(sql, context.requestPayload.runId, { code: "ENGINE_FAILURE", message });
+        await publishRunFinished(c.env, context.requestPayload.runId);
       },
     },
   );
