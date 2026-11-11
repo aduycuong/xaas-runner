@@ -92,6 +92,9 @@ export async function loadRun(sql: Sql, runId: string): Promise<RunPlan> {
     with started as (
       update runs set status = 'running', started_at = coalesce(started_at, now())
       where id = ${runId} and status = 'queued'
+      returning id
+    ), logged as (
+      insert into run_logs (id, run_id, level, message) select ${uuidv7()}::uuid, id, 'info', 'Run started' from started
     )
     select wv.definition, r.trigger_id, r.workspace_id, r.workflow_id, r.no
     from runs r join workflow_versions wv on wv.id = r.workflow_version_id
@@ -401,6 +404,7 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
         sql`update attempts set status = 'succeeded', http_status = ${verdict.httpStatus}, request = ${stored.request}::jsonb, response = ${stored.response}::jsonb, finished_at = now()
             where node_run_id = ${nodeRunId} and attempt = ${attempt}`,
         sql`update node_runs set status = ${status}, output = ${json(verdict.output)}::jsonb, finished_at = now() where id = ${nodeRunId}`,
+        sql`insert into run_logs (id, run_id, node_run_id, level, message) values (${uuidv7()}, ${runId}, ${nodeRunId}, 'info', ${attempt > 1 ? `Succeeded on attempt ${attempt}` : "Succeeded"})`,
       ]);
       end = { id: nodeId, status };
       nodeOutput = verdict.output;
@@ -477,13 +481,17 @@ async function finishAfterFailure(sql: Sql, runId: string, node: ActionNode, err
  */
 export async function finishRun(sql: Sql, runId: string, status: "succeeded" | "failed", error?: StoredError): Promise<void> {
   await sql`
-    update runs set status = ${status},
-      output = case when ${status}::text = 'succeeded' then coalesce((
-        select output from node_runs
-        where run_id = ${runId} and status in ('succeeded', 'warning') and node_type = 'action'
-        order by finished_at desc limit 1), 'null'::jsonb) else 'null'::jsonb end,
-      error = ${error ? json(error) : null}::jsonb, finished_at = now()
-    where id = ${runId} and status in ('queued', 'running')`;
+    with ended as (
+      update runs set status = ${status},
+        output = case when ${status}::text = 'succeeded' then coalesce((
+          select output from node_runs
+          where run_id = ${runId} and status in ('succeeded', 'warning') and node_type = 'action'
+          order by finished_at desc limit 1), 'null'::jsonb) else 'null'::jsonb end,
+        error = ${error ? json(error) : null}::jsonb, finished_at = now()
+      where id = ${runId} and status in ('queued', 'running')
+      returning id
+    )
+    insert into run_logs (id, run_id, level, message) select ${uuidv7()}::uuid, id, ${status === "failed" ? "error" : "info"}, ${status === "failed" ? "Run failed" : "Run succeeded"} from ended`;
 }
 
 /** Last step when no node step ended the run: records leftover skipped nodes, then finishes. */
