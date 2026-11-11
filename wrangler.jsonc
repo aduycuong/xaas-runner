@@ -18,4 +18,5 @@
   }
   // Secrets (wrangler secret put, or .dev.vars locally):
   //   DATABASE_URL, QSTASH_TOKEN, QSTASH_CURRENT_SIGNING_KEY, QSTASH_NEXT_SIGNING_KEY, RUNNER_ADMIN_TOKEN
+  // Optional, for realtime updates to the UI (same values as the app): FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY, FIREBASE_DATABASE_URL
 }

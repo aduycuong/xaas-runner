@@ -16,7 +16,7 @@ function planOf(raw: unknown): Extract<RunPlan, { ok: true }> {
   const { graph, issues } = validateGraph(raw);
   assert.deepEqual(issues, []);
   const nodes = Object.fromEntries((graph as Graph).nodes.map((n) => [n.id, { retries: 2, retryDelay: "1000" }]));
-  return { ok: true, graph: graph as Graph, triggerId: null, nodes };
+  return { ok: true, graph: graph as Graph, triggerId: null, nodes, info: { workspaceId: "w", workflowId: "f", no: 1 } };
 }
 
 /** Fake steps: records their names, and lets a test decide which actions fail. */

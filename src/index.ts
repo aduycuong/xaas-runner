@@ -4,9 +4,10 @@ import { Hono } from "hono";
 import { executeAction, failRun, finishWithSkips, loadRun, runBuiltIns, type CallNode } from "./engine";
 import { bindingName } from "./logic";
 import { orchestrate } from "./orchestrate";
+import { createRealtime, runEvents, type RtdbEnv } from "./rtdb";
 
 /** Secrets and vars. The service bindings to node Workers are read by name in `createCallNode`. */
-type Bindings = WorkflowBindings & {
+type Bindings = WorkflowBindings & RtdbEnv & {
   DATABASE_URL: string;
   /** Bearer token of `GET /nodes/:script/health`. The route answers 503 while it is not set. */
   RUNNER_ADMIN_TOKEN?: string;
@@ -89,16 +90,44 @@ app.post("/run/v3", async (c, next) => {
 app.post("/run/v3", (c) => {
   const sql = neon(c.env.DATABASE_URL);
   const callNode = createCallNode(c.env as unknown as Record<string, unknown>);
+  // Realtime writes happen in the background; they never slow a step or fail it.
+  const rt = createRealtime(c.env, (promise) => c.executionCtx.waitUntil(promise));
 
   const handler = serve<{ runId: string }, Bindings>(
     async (context) => {
       const { runId } = context.requestPayload;
-      const plan = await context.run("load", () => loadRun(sql, runId));
+      const plan = await context.run("load", async () => {
+        const loaded = await loadRun(sql, runId);
+        if (loaded.ok) runEvents(rt, { runId, ...loaded.info }).started();
+        return loaded;
+      });
+      const events = plan.ok ? runEvents(rt, { runId, ...plan.info }) : null;
+      const endRun = (status: "succeeded" | "failed") => events?.runEnded(status);
+      const skipped = (ids: string[]) => ids.forEach((id) => events?.nodeEnded(id, "skipped"));
+      const ended = (ends: { id: string; status: string }[]) => ends.forEach((end) => events?.nodeEnded(end.id, end.status));
+
       await orchestrate(plan, {
         step: (name, fn, settings) => context.run(name, fn, settings),
-        executeAction: (nodeId, options) => executeAction(sql, runId, nodeId, callNode, options),
-        runBuiltIns: (wire, skips) => runBuiltIns(sql, runId, wire, skips),
-        finish: (status, skips, error) => finishWithSkips(sql, runId, status, skips, error),
+        executeAction: async (nodeId, options) => {
+          events?.nodeRunning(nodeId);
+          skipped(options.skips);
+          const result = await executeAction(sql, runId, nodeId, callNode, options);
+          ended(result.ends);
+          if (result.failed) endRun("failed");
+          else if (result.finished && !result.ends.some((end) => end.status === "cancelled")) endRun("succeeded");
+          return result;
+        },
+        runBuiltIns: async (wire, skips) => {
+          skipped(skips);
+          const result = await runBuiltIns(sql, runId, wire, skips);
+          ended(result.ends);
+          return result;
+        },
+        finish: async (status, skips, error) => {
+          skipped(skips);
+          await finishWithSkips(sql, runId, status, skips, error);
+          endRun(status);
+        },
       });
     },
     {
