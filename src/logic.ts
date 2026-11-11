@@ -123,6 +123,45 @@ export function evaluateCondition(cond: Condition, scope: Scope): boolean {
   return order <= 0;
 }
 
+export type IfWalk = {
+  /** Every `flow.if` decided, in order, with the node it chose. */
+  steps: { id: string; next: string | null }[];
+  /** The first node that is not a `flow.if`, or null when the run ends. */
+  next: string | null;
+  /** Set when a `flow.if` could not be decided; `next` is then meaningless. */
+  failure?: { nodeId: string; error: StoredError };
+};
+
+/**
+ * Decides a chain of `flow.if` nodes starting at `from` without touching the database, so the
+ * step that ran the node before it can do it in the same call. Stops at the first node that is
+ * not a `flow.if` (including an unknown id; the caller reports that).
+ */
+export function walkIfNodes(nodes: Map<string, { id: string; type: string }>, from: string | null, scope: Scope): IfWalk {
+  const steps: IfWalk["steps"] = [];
+  const seen = new Set<string>();
+  let cursor = from;
+  while (cursor) {
+    const node = nodes.get(cursor) as IfNode | undefined;
+    if (!node || node.type !== "flow.if") break;
+    if (seen.has(cursor)) {
+      return { steps, next: null, failure: { nodeId: cursor, error: { code: "INVALID_GRAPH", message: `Node "${cursor}" was reached twice.` } } };
+    }
+    seen.add(cursor);
+    let next: string | null;
+    try {
+      const branch = node.branches.find((candidate) => evaluateCondition(candidate.when, scope));
+      next = branch ? branch.next : node.defaultNext;
+    } catch (error) {
+      if (!(error instanceof TemplateError)) throw error;
+      return { steps, next: null, failure: { nodeId: cursor, error: { code: "TEMPLATE_ERROR", message: error.message } } };
+    }
+    steps.push({ id: cursor, next });
+    cursor = next;
+  }
+  return { steps, next: cursor };
+}
+
 // ---------------------------------------------------------------------------
 // Calling a node Worker
 // ---------------------------------------------------------------------------

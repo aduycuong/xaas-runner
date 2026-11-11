@@ -8,6 +8,7 @@ import {
   resolveTemplate,
   retryDelay,
   TemplateError,
+  walkIfNodes,
 } from "./logic";
 
 const scope = {
@@ -112,4 +113,32 @@ test("binding name and retry delay", () => {
   assert.equal(retryDelay("none", 1000), "1000");
   assert.equal(retryDelay("linear", 500), "500 * (1 + retried)");
   assert.equal(retryDelay("exponential", 2000), "2000 * pow(2, retried)");
+});
+
+test("walkIfNodes: decides a chain of ifs and stops at the first worker", () => {
+  const ifNode = (id: string, left: unknown, yes: string | null, no: string | null) => ({
+    id,
+    type: "flow.if",
+    branches: [{ when: { left, op: "truthy" }, next: yes }],
+    defaultNext: no,
+  });
+  const nodes = new Map<string, { id: string; type: string }>(
+    [ifNode("a", "{{ input.limit }}", "b", null), ifNode("b", "", "w", "z"), { id: "w", type: "worker" }].map((n) => [n.id, n]),
+  );
+  const walk = walkIfNodes(nodes, "a", scope);
+  assert.deepEqual(walk.steps, [{ id: "a", next: "b" }, { id: "b", next: "z" }]);
+  assert.equal(walk.next, "z");
+  assert.equal(walkIfNodes(nodes, "w", scope).next, "w");
+  assert.equal(walkIfNodes(nodes, null, scope).next, null);
+});
+
+test("walkIfNodes: a loop of ifs fails and an undecidable if reports its node", () => {
+  const loop = new Map<string, { id: string; type: string }>([
+    ["a", { id: "a", type: "flow.if", branches: [{ when: { left: 1, op: "truthy" }, next: "a" }], defaultNext: null } as never],
+  ]);
+  assert.equal(walkIfNodes(loop, "a", scope).failure?.error.code, "INVALID_GRAPH");
+  const bad = new Map<string, { id: string; type: string }>([
+    ["a", { id: "a", type: "flow.if", branches: [{ when: { left: "{{ input.nope }}", op: "eq", right: 1 }, next: null }], defaultNext: null } as never],
+  ]);
+  assert.equal(walkIfNodes(bad, "a", scope).failure?.error.code, "TEMPLATE_ERROR");
 });
