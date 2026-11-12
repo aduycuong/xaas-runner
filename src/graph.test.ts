@@ -33,8 +33,8 @@ const edge = (source: string, target: string, sourceHandle = "out") => ({ source
 const branching = (): unknown => ({
   nodes: [
     trigger(),
-    { id: "check", type: "if", data: { join: "and", conditions: [{ left: "{{ trigger.vip }}", op: "equals", right: true }] } },
-    action("a", { text: { mode: "expr", value: "{{ trigger.name }}" } }),
+    { id: "check", type: "if", data: { join: "and", conditions: [{ left: "{{ input.vip }}", op: "equals", right: true }] } },
+    action("a", { text: { mode: "expr", value: "{{ input.name }}" } }),
     action("b"),
     { id: "join", type: "merge", data: { mode: "all" } },
     action("done", { first: { mode: "expr", value: "{{ nodes.join.output.a.echo | default(\"none\") }}" } }),
@@ -43,7 +43,8 @@ const branching = (): unknown => ({
 });
 
 const scope: Scope = {
-  trigger: { name: "An", vip: true, tags: ["x", "y"], n: 5 },
+  input: { name: "An", vip: true, tags: ["x", "y"], n: 5 },
+  trigger: { body: { who: "hook" }, headers: { "x-event": "push" }, query: {} },
   run: { id: "run_1", no: 7, env: "production" },
   nodes: { a: { output: { items: [{ price: 10 }, { price: 20 }], total: 2 } } },
 };
@@ -73,7 +74,7 @@ test("validateGraph checks expressions: syntax, upstream only, no vars or secret
     nodes: [trigger(), action("a", { x: { mode: "expr", value } }), action("b")],
     edges: [edge("t", "a"), edge("a", "b")],
   });
-  assert.deepEqual(validateGraph(withInput("{{ trigger.x }}")).issues, []);
+  assert.deepEqual(validateGraph(withInput("{{ input.x }}")).issues, []);
   assert.match(validateGraph(withInput("{{ nodes.b.output.y }}")).issues[0].message, /does not come before/);
   assert.match(validateGraph(withInput("{{ nodes.ghost.output.y }}")).issues[0].message, /unknown node "ghost"/);
   assert.match(validateGraph(withInput("{{ secrets.KEY }}")).issues[0].message, /not available yet/);
@@ -94,25 +95,28 @@ test("validateGraph: a disabled node cannot be published", () => {
 });
 
 test("expressions: paths, arrays, length, default, whole vs part", () => {
-  assert.equal(resolveValue("{{ trigger.name }}", scope), "An");
+  assert.equal(resolveValue("{{ input.name }}", scope), "An");
+  assert.equal(resolveValue("{{ trigger.body.who }}", scope), "hook");
+  assert.equal(resolveValue("{{ trigger.headers.x-event }}", scope), "push");
+  assert.equal(resolveValue("{{ trigger.name }}", scope, false), undefined); // the raw call is not the input
   assert.equal(resolveValue("{{ nodes.a.output.items[1].price }}", scope), 20);
   assert.equal(resolveValue("{{ nodes.a.output.items.length }}", scope), 2);
-  assert.deepEqual(resolveValue("{{ trigger.tags }}", scope), ["x", "y"]);
+  assert.deepEqual(resolveValue("{{ input.tags }}", scope), ["x", "y"]);
   assert.equal(resolveValue("{{ run.no }}", scope), 7);
-  assert.equal(resolveValue("{{ trigger.nope | default(\"n/a\") }}", scope), "n/a");
-  assert.equal(resolveValue("{{ trigger.nope | default(3) }}", scope), 3);
-  assert.equal(resolveValue("Hi {{ trigger.name }}, #{{ run.no }}", scope), "Hi An, #7");
-  assert.deepEqual(resolveValue({ a: ["{{ trigger.n }}"], b: 1 }, scope), { a: [5], b: 1 });
+  assert.equal(resolveValue("{{ input.nope | default(\"n/a\") }}", scope), "n/a");
+  assert.equal(resolveValue("{{ input.nope | default(3) }}", scope), 3);
+  assert.equal(resolveValue("Hi {{ input.name }}, #{{ run.no }}", scope), "Hi An, #7");
+  assert.deepEqual(resolveValue({ a: ["{{ input.n }}"], b: 1 }, scope), { a: [5], b: 1 });
 });
 
 test("expressions: a missing value is an error in inputs and empty in conditions", () => {
-  assert.throws(() => resolveValue("{{ trigger.nope }}", scope), ExpressionError);
+  assert.throws(() => resolveValue("{{ input.nope }}", scope), ExpressionError);
   assert.throws(() => resolveValue("{{ nodes.zzz.output.x }}", scope), ExpressionError);
   assert.throws(() => resolveValue("{{ secrets.K }}", scope), /not available yet/);
-  assert.equal(resolveValue("{{ trigger.nope }}", scope, false), undefined);
-  assert.throws(() => resolveInputs({ x: { mode: "expr", value: "{{ trigger.nope }}" } }, scope), /Input "x"/);
+  assert.equal(resolveValue("{{ input.nope }}", scope, false), undefined);
+  assert.throws(() => resolveInputs({ x: { mode: "expr", value: "{{ input.nope }}" } }, scope), /Input "x"/);
   assert.deepEqual(resolveInputs({ x: { mode: "fixed", value: "{{ not an expression }}" } }, scope), { x: "{{ not an expression }}" });
-  assert.deepEqual(collectExpressions({ a: "{{ trigger.a }} {{ run.id }}", b: [1, "{{ nodes.x.output.y }}"] }), [" trigger.a ", " run.id ", " nodes.x.output.y "]);
+  assert.deepEqual(collectExpressions({ a: "{{ input.a }} {{ run.id }}", b: [1, "{{ nodes.x.output.y }}"] }), [" input.a ", " run.id ", " nodes.x.output.y "]);
 });
 
 test("compare: every operator", () => {
@@ -136,22 +140,22 @@ test("compare: every operator", () => {
 test("evaluateIf: and / or, and a missing value counts as empty", () => {
   const node = (join: "and" | "or") => ({
     id: "i", type: "if" as const,
-    data: { join, conditions: [{ left: "{{ trigger.n }}", op: "gt" as const, right: 3 }, { left: "{{ trigger.name }}", op: "equals" as const, right: "Bo" }] },
+    data: { join, conditions: [{ left: "{{ input.n }}", op: "gt" as const, right: 3 }, { left: "{{ input.name }}", op: "equals" as const, right: "Bo" }] },
   });
   assert.equal(evaluateIf(node("and"), scope), "false");
   assert.equal(evaluateIf(node("or"), scope), "true");
-  const empty = { id: "i", type: "if" as const, data: { join: "and" as const, conditions: [{ left: "{{ trigger.nope }}", op: "is_empty" as const }] } };
+  const empty = { id: "i", type: "if" as const, data: { join: "and" as const, conditions: [{ left: "{{ input.nope }}", op: "is_empty" as const }] } };
   assert.equal(evaluateIf(empty, scope), "true");
 });
 
 test("evaluateSwitch: first match, default, or nothing", () => {
   const node = (fallback: boolean) => ({
     id: "s", type: "switch" as const,
-    data: { value: "{{ trigger.n }}", cases: [{ id: "hot", op: "gte" as const, right: 80 }, { id: "warm", op: "gte" as const, right: 5 }, { id: "also", op: "gte" as const, right: 1 }], fallback },
+    data: { value: "{{ input.n }}", cases: [{ id: "hot", op: "gte" as const, right: 80 }, { id: "warm", op: "gte" as const, right: 5 }, { id: "also", op: "gte" as const, right: 1 }], fallback },
   });
   assert.equal(evaluateSwitch(node(true), scope), "warm");
-  assert.equal(evaluateSwitch(node(true), { ...scope, trigger: { n: 0 } }), "default");
-  assert.equal(evaluateSwitch(node(false), { ...scope, trigger: { n: 0 } }), null);
+  assert.equal(evaluateSwitch(node(true), { ...scope, input: { n: 0 } }), "default");
+  assert.equal(evaluateSwitch(node(false), { ...scope, input: { n: 0 } }), null);
 });
 
 /** Runs a graph with a fake executor: every action succeeds unless listed in `fail`. Returns statuses in order. */
@@ -163,7 +167,7 @@ function simulate(raw: unknown, trig: unknown, options: { fail?: string[]; fired
   const outputs: Record<string, unknown> = {};
   const ran: string[] = [];
   const waves: string[][] = [];
-  const scopeNow = (): Scope => ({ trigger: trig, run: { id: "r", no: 1, env: "production" }, nodes: Object.fromEntries(Object.entries(outputs).map(([k, v]) => [k, { output: v }])) });
+  const scopeNow = (): Scope => ({ input: trig, trigger: {}, run: { id: "r", no: 1, env: "production" }, nodes: Object.fromEntries(Object.entries(outputs).map(([k, v]) => [k, { output: v }])) });
   for (let guard = 0; guard < 50; guard++) {
     const { ready } = planNext(g, state);
     if (ready.length === 0) break;
@@ -214,7 +218,7 @@ test("run: switch takes the matching case; nodes after other cases are skipped",
   const g = {
     nodes: [
       trigger(),
-      { id: "tier", type: "switch", data: { value: "{{ trigger.score }}", cases: [{ id: "hot", op: "gte", right: 80 }, { id: "warm", op: "gte", right: 40 }], fallback: true } },
+      { id: "tier", type: "switch", data: { value: "{{ input.score }}", cases: [{ id: "hot", op: "gte", right: 80 }, { id: "warm", op: "gte", right: 40 }], fallback: true } },
       action("hotNode"), action("warmNode"), action("coldNode"),
     ],
     edges: [edge("t", "tier"), edge("tier", "hotNode", "hot"), edge("tier", "warmNode", "warm"), edge("tier", "coldNode", "default")],
@@ -225,7 +229,7 @@ test("run: switch takes the matching case; nodes after other cases are skipped",
 
 test("run: a switch with no match and no default skips everything below it", () => {
   const g = {
-    nodes: [trigger(), { id: "s", type: "switch", data: { value: "{{ trigger.x }}", cases: [{ id: "one", op: "equals", right: 1 }], fallback: false } }, action("a"), action("after")],
+    nodes: [trigger(), { id: "s", type: "switch", data: { value: "{{ input.x }}", cases: [{ id: "one", op: "equals", right: 1 }], fallback: false } }, action("a"), action("after")],
     edges: [edge("t", "s"), edge("s", "a", "one"), edge("a", "after")],
   };
   const r = simulate(g, { x: 2 });

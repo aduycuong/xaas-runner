@@ -107,7 +107,8 @@ app.post("/run/v3", (c) => {
       const events = plan.ok ? runEvents(rt, { runId, ...plan.info }) : null;
       const endRun = (status: "succeeded" | "failed") => {
         events?.runEnded(status);
-        c.executionCtx.waitUntil(publishRunFinished(c.env, runId));
+        // A test run starts nothing else: no queue to advance, no event trigger to fire.
+        if (!plan.ok || !plan.info.test) c.executionCtx.waitUntil(publishRunFinished(c.env, runId));
       };
       const skipped = (ids: string[]) => ids.forEach((id) => events?.nodeEnded(id, "skipped"));
       const ended = (ends: { id: string; status: string }[]) => ends.forEach((end) => events?.nodeEnded(end.id, end.status));

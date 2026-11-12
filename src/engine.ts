@@ -9,6 +9,7 @@
 import type { NeonQueryFunction } from "@neondatabase/serverless";
 import {
   emptyState,
+  graphSchema,
   evaluateIf,
   evaluateSwitch,
   ExpressionError,
@@ -36,7 +37,7 @@ export type PlanNode = { retries: number; retryDelay: string };
  * only what the code between steps needs.
  */
 export type RunPlan =
-  | { ok: true; graph: Graph; triggerId: string | null; nodes: Record<string, PlanNode>; info: { workspaceId: string; workflowId: string; no: number } }
+  | { ok: true; graph: Graph; triggerId: string | null; nodes: Record<string, PlanNode>; info: { workspaceId: string; workflowId: string; no: number; test: boolean } }
   | { ok: false; error: StoredError };
 
 export type NodeCall = {
@@ -83,6 +84,36 @@ export type StepResult = {
 };
 
 // ---------------------------------------------------------------------------
+// Test runs (started from the editor on the draft)
+// ---------------------------------------------------------------------------
+
+/** `runs.test`: set for a run started from the editor. `nodeId` limits it to one node; `outputs` is what the nodes before it produced. */
+export type TestSpec = { nodeId?: string; outputs?: Record<string, unknown> } | null;
+
+/** One pinned output of the draft: `workflow_versions.pins[nodeId]`. */
+export type Pins = Record<string, { output?: unknown } | undefined>;
+
+/**
+ * The graph a run executes. A real run and a whole-workflow test run the stored definition. A test of one node runs a
+ * graph of the trigger and that node only: the rest of the draft may be unfinished and is not even validated.
+ */
+export function graphOfRun(definition: unknown, test: TestSpec): { graph: Graph | null; message?: string } {
+  if (!test?.nodeId) {
+    const { graph, issues } = validateGraph(definition);
+    return graph && issues.length === 0 ? { graph } : { graph: null, message: issues[0]?.message ?? "unknown error" };
+  }
+  const parsed = graphSchema.safeParse(definition);
+  if (!parsed.success) return { graph: null, message: "The draft could not be read." };
+  const target = parsed.data.nodes.find((node) => node.id === test.nodeId);
+  const trigger = parsed.data.nodes.find((node) => node.type === "trigger");
+  if (!target || target.type === "trigger") return { graph: null, message: `Node "${test.nodeId}" is not in the draft.` };
+  const nodes = trigger ? [trigger, target] : [target];
+  const reduced = { nodes, edges: trigger ? [{ source: trigger.id, sourceHandle: "out", target: target.id, targetHandle: "in" }] : [] };
+  // Not validated as a whole: the node reads nodes that are not in this graph, their outputs come with the run (`test.outputs`).
+  return { graph: graphSchema.parse(reduced) };
+}
+
+// ---------------------------------------------------------------------------
 // load
 // ---------------------------------------------------------------------------
 
@@ -96,16 +127,13 @@ export async function loadRun(sql: Sql, runId: string): Promise<RunPlan> {
     ), logged as (
       insert into run_logs (id, run_id, level, message) select ${uuidv7()}::uuid, id, 'info', 'Run started' from started
     )
-    select wv.definition, r.trigger_id, r.workspace_id, r.workflow_id, r.no
+    select wv.definition, r.test, r.trigger_id, r.workspace_id, r.workflow_id, r.no
     from runs r join workflow_versions wv on wv.id = r.workflow_version_id
     where r.id = ${runId}`;
   if (!run) return { ok: false, error: { code: "RUN_NOT_FOUND", message: `Run ${runId} does not exist.` } };
 
-  const { graph, issues } = validateGraph(run.definition);
-  if (!graph || issues.length) {
-    const first = issues[0];
-    return { ok: false, error: { code: "INVALID_DEFINITION", message: `Invalid workflow definition: ${first ? first.message : "unknown error"}` } };
-  }
+  const { graph, message } = graphOfRun(run.definition, (run.test as TestSpec) ?? null);
+  if (!graph) return { ok: false, error: { code: "INVALID_DEFINITION", message: `Invalid workflow definition: ${message}` } };
 
   const actions = graph.nodes.filter((node): node is Extract<GraphNode, { type: "action" }> => node.type === "action");
   const keys = [...new Set(actions.map((node) => node.data.nodeKey))];
@@ -133,7 +161,7 @@ export async function loadRun(sql: Sql, runId: string): Promise<RunPlan> {
     const attempts = node.data.settings.maxAttempts ?? version.retry_max_attempts;
     nodes[node.id] = { retries: Math.max(0, attempts - 1) + INFRA_RETRIES, retryDelay: retryDelay(version.retry_backoff, version.retry_base_delay_ms) };
   }
-  return { ok: true, graph, triggerId: run.trigger_id ?? null, nodes, info: { workspaceId: run.workspace_id, workflowId: run.workflow_id, no: Number(run.no) } };
+  return { ok: true, graph, triggerId: run.trigger_id ?? null, nodes, info: { workspaceId: run.workspace_id, workflowId: run.workflow_id, no: Number(run.no), test: run.test != null } };
 }
 
 // ---------------------------------------------------------------------------
@@ -142,9 +170,12 @@ export async function loadRun(sql: Sql, runId: string): Promise<RunPlan> {
 
 type RunRow = {
   input: unknown;
+  trigger_data: unknown;
   no: number;
   env: string;
   status: string;
+  test: TestSpec;
+  pins: Pins;
   workflow_slug: string;
   workflow_version: number;
   definition: unknown;
@@ -154,7 +185,7 @@ type VersionRow = { id: string; key: string; version: string; script_name: strin
 
 async function readRun(sql: Sql, runId: string): Promise<{ run: RunRow; nodeRuns: NodeRunRow[] } | null> {
   const [runs, nodeRuns] = await sql.transaction([
-    sql`select r.input, r.no, r.env, r.status, w.slug as workflow_slug, wv.version as workflow_version, wv.definition
+    sql`select r.input, r.trigger_data, r.no, r.env, r.status, r.test, wv.pins, w.slug as workflow_slug, wv.version as workflow_version, wv.definition
         from runs r join workflows w on w.id = r.workflow_id join workflow_versions wv on wv.id = r.workflow_version_id
         where r.id = ${runId}`,
     sql`select node_id, status, output, error from node_runs where run_id = ${runId}`,
@@ -166,11 +197,13 @@ async function readRun(sql: Sql, runId: string): Promise<{ run: RunRow; nodeRuns
 function buildScope(run: RunRow, runId: string, nodeRuns: NodeRunRow[], extra: Record<string, unknown> = {}): { scope: Scope; outputs: Record<string, unknown> } {
   const outputs: Record<string, unknown> = {};
   for (const row of nodeRuns) if (row.status === "succeeded" || row.status === "warning") outputs[row.node_id] = row.output;
-  Object.assign(outputs, extra);
+  Object.assign(outputs, run.test?.outputs ?? {}, extra);
   return {
     outputs,
     scope: {
-      trigger: run.input,
+      input: run.input,
+      // The raw call that started the run (`trigger.body`, `trigger.headers`, …). Runs started before it was kept, and runs started from the app, have none.
+      trigger: run.trigger_data ?? {},
       run: { id: runId, no: run.no, env: run.env },
       nodes: Object.fromEntries(Object.entries(outputs).map(([id, output]) => [id, { output }])),
     },
@@ -254,7 +287,7 @@ export function decideBuiltIns(graph: Graph, state: RunState, scope: Scope, outp
 export async function runBuiltIns(sql: Sql, runId: string, wire: WireState, pendingSkips: string[]): Promise<StepResult> {
   const read = await readRun(sql, runId);
   if (!read) return { ends: [], finished: true, failed: { code: "RUN_NOT_FOUND", message: `Run ${runId} does not exist.` } };
-  const { graph } = validateGraph(read.run.definition);
+  const { graph } = graphOfRun(read.run.definition, read.run.test);
   if (!graph) throw new Error("The definition was valid at load time.");
 
   const state = fromWire(wire);
@@ -307,7 +340,7 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
   const read = await readRun(sql, runId);
   if (!read) return { ends: [], finished: true, failed: { code: "RUN_NOT_FOUND", message: `Run ${runId} does not exist.` } };
   const { run, nodeRuns } = read;
-  const { graph } = validateGraph(run.definition);
+  const { graph } = graphOfRun(run.definition, run.test);
   if (!graph) throw new Error("The definition was valid at load time.");
   const node = graph.nodes.find((candidate) => candidate.id === nodeId);
   if (!node || node.type !== "action") {
@@ -336,6 +369,25 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
     nodeOutput = existing.output;
   } else if (existing?.status === "failed") {
     failure = existing.error ?? { code: "NODE_FAILED", message: "The node run failed." };
+  } else if (!run.test?.nodeId && run.test && run.pins?.[nodeId] !== undefined) {
+    // A test of the whole draft does not call a pinned node: the pinned output stands in for it.
+    const pinned = run.pins[nodeId]?.output ?? null;
+    const { scope } = buildScope(run, runId, nodeRuns);
+    let input: Record<string, unknown> | null = null;
+    try {
+      input = resolveInputs(node.data.inputs, scope);
+    } catch {
+      input = null;
+    }
+    await sql.transaction([
+      ...skipRows,
+      sql`insert into node_runs (id, run_id, node_id, node_type, label, status, input, output, attempt_count, finished_at)
+          values (${uuidv7()}, ${runId}, ${nodeId}, 'action', ${label}, 'succeeded', ${json(input)}::jsonb, ${json(pinned)}::jsonb, 0, now())
+          on conflict (run_id, node_id) do update set status = 'succeeded', output = excluded.output, finished_at = now()`,
+      sql`insert into run_logs (id, run_id, level, message) values (${uuidv7()}, ${runId}, 'info', ${`Node "${label}" is pinned: its pinned output was used, the node was not called.`})`,
+    ]);
+    end = { id: nodeId, status: "succeeded" };
+    nodeOutput = pinned;
   } else {
     const version = await loadVersion(sql, node);
     if (!version) {
@@ -499,7 +551,7 @@ export async function finishWithSkips(sql: Sql, runId: string, status: "succeede
   if (pendingSkips.length) {
     const read = await readRun(sql, runId);
     if (read) {
-      const { graph } = validateGraph(read.run.definition);
+      const { graph } = graphOfRun(read.run.definition, read.run.test);
       if (graph) {
         const queries = writeNodeRuns(sql, runId, rowsForSkipped(graph, pendingSkips));
         if (queries.length) await sql.transaction(queries);
