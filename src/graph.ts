@@ -168,7 +168,7 @@ export function parseExpression(source: string): Path {
     rest = rest.slice(1 + name.length);
   }
 
-  if (root === "vars" || root === "secrets") throw new ExpressionError(`"${root}" is not available yet.`);
+  if (root === "vars" || root === "secrets") throw new ExpressionError(`"${root}" is not an expression: a node reads secrets and variables by name, in the environment of the run.`);
   if (!["input", "trigger", "nodes", "run"].includes(root)) throw new ExpressionError(`Unknown source "${root}" in "{{ ${text} }}". Use input, trigger, nodes or run.`);
   if (root === "nodes" && (typeof segments[0] !== "string" || segments[1] !== "output")) {
     throw new ExpressionError(`"{{ ${text} }}" must look like nodes.<id>.output...`);
@@ -403,7 +403,7 @@ export function validateGraph(input: unknown): { graph: Graph | null; issues: Is
   }
   for (const node of graph.nodes) if (!reached.has(node.id)) add(node.id, "nodes", `Node "${node.id}" cannot be reached from a trigger.`);
 
-  // Expressions: valid syntax, no vars/secrets yet, and only nodes that come before.
+  // Expressions: valid syntax, no vars/secrets (nodes read them by name), and only nodes that come before.
   const ancestors = (id: string): Set<string> => {
     const seen = new Set<string>();
     const walk = [id];

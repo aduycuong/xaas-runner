@@ -69,7 +69,7 @@ test("validateGraph reports every kind of mistake", () => {
   assert.match(messages({ ...g, edges: g.edges.filter((e) => (e as { source: string }).source !== "b") }).join("|"), /Merge "join" needs at least two/);
 });
 
-test("validateGraph checks expressions: syntax, upstream only, no vars or secrets yet", () => {
+test("validateGraph checks expressions: syntax, upstream only, no vars or secrets", () => {
   const withInput = (value: string) => ({
     nodes: [trigger(), action("a", { x: { mode: "expr", value } }), action("b")],
     edges: [edge("t", "a"), edge("a", "b")],
@@ -77,7 +77,7 @@ test("validateGraph checks expressions: syntax, upstream only, no vars or secret
   assert.deepEqual(validateGraph(withInput("{{ input.x }}")).issues, []);
   assert.match(validateGraph(withInput("{{ nodes.b.output.y }}")).issues[0].message, /does not come before/);
   assert.match(validateGraph(withInput("{{ nodes.ghost.output.y }}")).issues[0].message, /unknown node "ghost"/);
-  assert.match(validateGraph(withInput("{{ secrets.KEY }}")).issues[0].message, /not available yet/);
+  assert.match(validateGraph(withInput("{{ secrets.KEY }}")).issues[0].message, /is not an expression/);
   assert.match(validateGraph(withInput("{{ nodes.b.y }}")).issues[0].message, /nodes.<id>.output/);
   assert.match(validateGraph(withInput("{{ foo.bar }}")).issues[0].message, /Unknown source/);
 });
@@ -112,7 +112,7 @@ test("expressions: paths, arrays, length, default, whole vs part", () => {
 test("expressions: a missing value is an error in inputs and empty in conditions", () => {
   assert.throws(() => resolveValue("{{ input.nope }}", scope), ExpressionError);
   assert.throws(() => resolveValue("{{ nodes.zzz.output.x }}", scope), ExpressionError);
-  assert.throws(() => resolveValue("{{ secrets.K }}", scope), /not available yet/);
+  assert.throws(() => resolveValue("{{ secrets.K }}", scope), /is not an expression/);
   assert.equal(resolveValue("{{ input.nope }}", scope, false), undefined);
   assert.throws(() => resolveInputs({ x: { mode: "expr", value: "{{ input.nope }}" } }, scope), /Input "x"/);
   assert.deepEqual(resolveInputs({ x: { mode: "fixed", value: "{{ not an expression }}" } }, scope), { x: "{{ not an expression }}" });
