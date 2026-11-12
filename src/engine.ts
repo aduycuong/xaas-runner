@@ -169,6 +169,7 @@ export async function loadRun(sql: Sql, runId: string): Promise<RunPlan> {
 // ---------------------------------------------------------------------------
 
 type RunRow = {
+  workspace_id: string;
   input: unknown;
   trigger_data: unknown;
   no: number;
@@ -185,7 +186,7 @@ type VersionRow = { id: string; key: string; version: string; script_name: strin
 
 async function readRun(sql: Sql, runId: string): Promise<{ run: RunRow; nodeRuns: NodeRunRow[] } | null> {
   const [runs, nodeRuns] = await sql.transaction([
-    sql`select r.input, r.trigger_data, r.no, r.env, r.status, r.test, wv.pins, w.slug as workflow_slug, wv.version as workflow_version, wv.definition
+    sql`select r.workspace_id, r.input, r.trigger_data, r.no, r.env, r.status, r.test, wv.pins, w.slug as workflow_slug, wv.version as workflow_version, wv.definition
         from runs r join workflows w on w.id = r.workflow_id join workflow_versions wv on wv.id = r.workflow_version_id
         where r.id = ${runId}`,
     sql`select node_id, status, output, error from node_runs where run_id = ${runId}`,
@@ -441,8 +442,9 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
     };
     const envelope = {
       input,
-      context: { vars: {} },
-      run: { id: runId, no: run.no, workflow: run.workflow_slug, version: run.workflow_version, env: run.env },
+      // Secrets and variables never travel here: the node reads them by name for `run.workspace` + `run.env`.
+      context: {},
+      run: { id: runId, no: run.no, workspace: run.workspace_id, workflow: run.workflow_slug, version: run.workflow_version, env: run.env },
       node: { key: version.key, version: version.version, label },
     };
     const outcome = await callNode({ scriptName: version.script_name, transport: version.transport, timeoutMs, headers, body: JSON.stringify(envelope) });
