@@ -11,7 +11,8 @@
   // with every other character turned into "_" (bindingName in src/logic.ts).
   // To add a node: deploy the node Worker first, add its binding here, then deploy the runner.
   "services": [
-    { "binding": "NODE_CORE_ECHO_V1_0_0", "service": "node-core-echo-v1-0-0" }
+    { "binding": "NODE_CORE_ECHO_V1_0_0", "service": "node-core-echo-v1-0-0" },
+    { "binding": "NODE_CORE_ECHO_V1_1_0", "service": "node-core-echo-v1-1-0" }
   ],
   "vars": {
     "QSTASH_URL": "https://qstash-us-east-1.upstash.io",
