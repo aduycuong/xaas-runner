@@ -16,7 +16,7 @@ function planOf(raw: unknown): Extract<RunPlan, { ok: true }> {
   const { graph, issues } = validateGraph(raw);
   assert.deepEqual(issues, []);
   const nodes = Object.fromEntries((graph as Graph).nodes.map((n) => [n.id, { retries: 2, retryDelay: "1000" }]));
-  return { ok: true, graph: graph as Graph, triggerId: null, nodes, info: { workspaceId: "w", workflowId: "f", no: 1 } };
+  return { ok: true, graph: graph as Graph, triggerId: null, nodes, info: { workspaceId: "w", workflowId: "f", no: 1, test: false } };
 }
 
 /** Fake steps: records their names, and lets a test decide which actions fail. */
@@ -74,7 +74,7 @@ test("orchestrate: an if is decided in a flow step and the skipped branch is rec
   };
   const plan = planOf(raw);
   const h = harness();
-  const scope = { trigger: {}, run: { id: "r", no: 1, env: "production" }, nodes: {} };
+  const scope = { input: {}, trigger: {}, run: { id: "r", no: 1, env: "production" }, nodes: {} };
   h.setDecide((wire) => {
     const decided = decideBuiltIns(plan.graph, fromWire(wire), scope, {});
     return { ends: decided.ends, finished: false };

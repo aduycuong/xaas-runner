@@ -106,7 +106,8 @@ export const livePath = (workspaceId: string, runId: string) => `liveRuns/${work
 
 export const nodePath = (runId: string, nodeId: string) => `runs/${runId}/nodes/${nodeId}`;
 
-export type RunInfo = { runId: string; workspaceId: string; workflowId: string; no: number };
+/** `test` runs (started from the editor) are not listed among the live runs of the workspace. */
+export type RunInfo = { runId: string; workspaceId: string; workflowId: string; no: number; test?: boolean };
 
 /** The few events the UI follows, turned into writes. Built on top of `Realtime`, so it never throws. */
 export function runEvents(rt: Realtime, run: RunInfo) {
@@ -114,7 +115,7 @@ export function runEvents(rt: Realtime, run: RunInfo) {
   return {
     started() {
       rt.update(runPath(run.runId), { status: "running", updatedAt: now() });
-      rt.set(livePath(run.workspaceId, run.runId), { workflowId: run.workflowId, no: run.no, status: "running", updatedAt: now() });
+      if (!run.test) rt.set(livePath(run.workspaceId, run.runId), { workflowId: run.workflowId, no: run.no, status: "running", updatedAt: now() });
     },
     nodeRunning(nodeId: string) {
       rt.update(nodePath(run.runId, nodeId), { status: "running", updatedAt: now() });

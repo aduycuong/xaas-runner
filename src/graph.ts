@@ -116,10 +116,13 @@ export type MergeNode = z.infer<typeof mergeNode>;
 export type Issue = { nodeId: string | null; path: string; message: string };
 
 // ---------------------------------------------------------------------------
-// Expressions: {{ trigger.x }} · {{ nodes.<id>.output.items[0].name }} · {{ run.id }} · {{ x | default("n/a") }}
+// Expressions: {{ input.x }} · {{ trigger.body.x }} · {{ nodes.<id>.output.items[0].name }} · {{ run.id }} · {{ x | default("n/a") }}
 // ---------------------------------------------------------------------------
 
 export type Scope = {
+  /** The input of the run: what the trigger made of the call (its mapping, or the whole body). */
+  input: unknown;
+  /** The raw data of the call that started the run: `{ body, headers, query }`, plus `scheduledAt` for a schedule. */
   trigger: unknown;
   run: { id: string; no: number | null; env: string };
   nodes: Record<string, { output: unknown }>;
@@ -166,7 +169,7 @@ export function parseExpression(source: string): Path {
   }
 
   if (root === "vars" || root === "secrets") throw new ExpressionError(`"${root}" is not available yet.`);
-  if (!["trigger", "nodes", "run"].includes(root)) throw new ExpressionError(`Unknown source "${root}" in "{{ ${text} }}". Use trigger, nodes or run.`);
+  if (!["input", "trigger", "nodes", "run"].includes(root)) throw new ExpressionError(`Unknown source "${root}" in "{{ ${text} }}". Use input, trigger, nodes or run.`);
   if (root === "nodes" && (typeof segments[0] !== "string" || segments[1] !== "output")) {
     throw new ExpressionError(`"{{ ${text} }}" must look like nodes.<id>.output...`);
   }
@@ -177,7 +180,8 @@ export function parseExpression(source: string): Path {
 function readPath(path: Path, scope: Scope): unknown {
   let current: unknown;
   let segments = path.segments;
-  if (path.root === "trigger") current = scope.trigger;
+  if (path.root === "input") current = scope.input;
+  else if (path.root === "trigger") current = scope.trigger;
   else if (path.root === "run") current = scope.run;
   else {
     const entry = scope.nodes[segments[0] as string];
