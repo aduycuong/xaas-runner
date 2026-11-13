@@ -33,13 +33,28 @@ const positionSchema = z.object({ x: z.number(), y: z.number() }).optional();
 
 const inputSchema = z.object({ mode: z.enum(["fixed", "expr"]), value: z.unknown() });
 
-const resourcesSchema = z
-  .object({
-    connections: z.record(z.string(), z.uuid()).default({}),
-    secrets: z.record(z.string(), z.string().max(64)).default({}),
-    variables: z.record(z.string(), z.string().max(64)).default({}),
-  })
-  .default({ connections: {}, secrets: {}, variables: {} });
+/**
+ * What a node resource is chosen to be, by the resource's name: a secret or variable name, or a connection id (string);
+ * an item of a connection (Drive file or folder, channel, chat, Page); a path in workspace files.
+ */
+const resourceChoiceSchema = z.union([
+  z.string().min(1).max(64),
+  z.object({ connectionId: z.uuid(), id: z.string().min(1).max(200) }),
+  z.object({ path: z.string().min(1).max(500) }),
+]);
+
+/** Reads the first shape (`{ connections, secrets, variables }` of maps) as the flat one. */
+function flattenResources(value: unknown): unknown {
+  if (value == null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) return value;
+  const groups = ["connections", "secrets", "variables"];
+  const entries = Object.entries(value as Record<string, unknown>);
+  const isOld = entries.length > 0 && entries.every(([key, inner]) => groups.includes(key) && inner !== null && typeof inner === "object" && !("connectionId" in inner) && !("path" in inner));
+  return isOld ? Object.assign({}, ...entries.map(([, inner]) => inner)) : value;
+}
+
+const resourcesSchema = z.preprocess(flattenResources, z.record(z.string(), resourceChoiceSchema));
+export type ResourceChoice = z.infer<typeof resourceChoiceSchema>;
 
 const settingsSchema = z
   .object({
@@ -71,8 +86,9 @@ const actionNode = z.object({
     settings: settingsSchema,
     disabled: z.boolean().default(false),
     /**
-     * What the node may use from the workspace, keyed by the logical names of its `requires`: a connection id, the name of a
-     * secret, the name of a variable. Never values, and no environment: values are those of the run's environment.
+     * What the node may use from the workspace, keyed by the names of its `resources`: a secret or variable name, a
+     * connection id, an item of a connection, a path in workspace files. Never values, and no environment: secrets and
+     * variables take the value of the run's environment.
      */
     resources: resourcesSchema,
   }),
