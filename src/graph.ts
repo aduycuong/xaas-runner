@@ -33,6 +33,14 @@ const positionSchema = z.object({ x: z.number(), y: z.number() }).optional();
 
 const inputSchema = z.object({ mode: z.enum(["fixed", "expr"]), value: z.unknown() });
 
+const resourcesSchema = z
+  .object({
+    connections: z.record(z.string(), z.uuid()).default({}),
+    secrets: z.record(z.string(), z.string().max(64)).default({}),
+    variables: z.record(z.string(), z.string().max(64)).default({}),
+  })
+  .default({ connections: {}, secrets: {}, variables: {} });
+
 const settingsSchema = z
   .object({
     onError: z.enum(["stop", "continue"]).default("stop"),
@@ -62,6 +70,11 @@ const actionNode = z.object({
     inputs: z.record(z.string(), inputSchema).default({}),
     settings: settingsSchema,
     disabled: z.boolean().default(false),
+    /**
+     * What the node may use from the workspace, keyed by the logical names of its `requires`: a connection id, the name of a
+     * secret, the name of a variable. Never values, and no environment: values are those of the run's environment.
+     */
+    resources: resourcesSchema,
   }),
 });
 
