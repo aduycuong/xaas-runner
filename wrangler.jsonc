@@ -14,7 +14,8 @@
     { "binding": "NODE_CORE_ECHO_V1_0_0", "service": "node-core-echo-v1-0-0" },
     { "binding": "NODE_CORE_ECHO_V1_1_0", "service": "node-core-echo-v1-1-0" },
     { "binding": "NODE_CORE_ECHO_V1_2_0", "service": "node-core-echo-v1-2-0" },
-    { "binding": "NODE_CORE_ECHO_V1_3_0", "service": "node-core-echo-v1-3-0" }
+    { "binding": "NODE_CORE_ECHO_V1_3_0", "service": "node-core-echo-v1-3-0" },
+    { "binding": "NODE_CORE_ECHO_V1_4_0", "service": "node-core-echo-v1-4-0" }
   ],
   "vars": {
     "QSTASH_URL": "https://qstash-us-east-1.upstash.io",
