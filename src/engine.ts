@@ -26,6 +26,7 @@ import {
   type StoredError,
 } from "./graph";
 import { judgeNodeOutcome, retryDelay, uuidv7, type NodeOutcome } from "./logic";
+import { newResourceToken, RESOURCE_TOKEN_GRACE_MS } from "./resource-token";
 
 export type Sql = NeonQueryFunction<false, false>;
 
@@ -411,6 +412,8 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
 
     const maxAttempts = node.data.settings.maxAttempts ?? version.retry_max_attempts;
     const timeoutMs = node.data.settings.timeout ?? version.timeout_ms;
+    // The run token of this attempt: the node shows it to xaas-resource-broker. Only its hash is stored (with the attempt).
+    const resourceToken = await newResourceToken();
     const [nodeRun] = await sql`
       with nr as (
         insert into node_runs (id, run_id, node_id, node_type, label, node_version_id, attempt_count, input)
@@ -418,8 +421,9 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
         on conflict (run_id, node_id) do update set attempt_count = node_runs.attempt_count + 1
         returning id, attempt_count
       ), at as (
-        insert into attempts (id, node_run_id, attempt)
-        select ${uuidv7()}::uuid, nr.id, nr.attempt_count from nr where nr.attempt_count <= ${maxAttempts}::int
+        insert into attempts (id, node_run_id, attempt, resource_token_hash, resource_token_expires_at)
+        select ${uuidv7()}::uuid, nr.id, nr.attempt_count, ${resourceToken.hash}, now() + ${timeoutMs + RESOURCE_TOKEN_GRACE_MS} * interval '1 millisecond'
+        from nr where nr.attempt_count <= ${maxAttempts}::int
         on conflict (node_run_id, attempt) do nothing
       )
       select id, attempt_count from nr`;
@@ -440,14 +444,16 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
       // The same for every attempt, so the node can skip work it already did.
       "Idempotency-Key": nodeRunId,
     };
+    // Sent to the node, never stored: `headers` (what `attempts.request` keeps) leaves it out.
+    const sentHeaders = { ...headers, "X-XAAS-Resource-Token": resourceToken.token };
     const envelope = {
       input,
-      // Secrets and variables never travel here: the node reads them by name for `run.workspace` + `run.env`.
+      // Secrets, variables and connections never travel here: the node reads what is mapped to it through the resource broker.
       context: {},
       run: { id: runId, no: run.no, workspace: run.workspace_id, workflow: run.workflow_slug, version: run.workflow_version, env: run.env },
       node: { key: version.key, version: version.version, label },
     };
-    const outcome = await callNode({ scriptName: version.script_name, transport: version.transport, timeoutMs, headers, body: JSON.stringify(envelope) });
+    const outcome = await callNode({ scriptName: version.script_name, transport: version.transport, timeoutMs, headers: sentHeaders, body: JSON.stringify(envelope) });
     const verdict = judgeNodeOutcome(outcome);
     const stored = { request: json({ headers, body: envelope }), response: json(capped(outcome.kind === "response" ? { status: outcome.status, body: outcome.body } : { kind: outcome.kind })) };
 
