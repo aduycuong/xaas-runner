@@ -198,6 +198,7 @@ export function parseExpression(source: string): Path {
   }
 
   if (root === "vars" || root === "secrets") throw new ExpressionError(`"${root}" is not an expression: a node reads secrets and variables by name, in the environment of the run.`);
+  if (root === "files") throw new ExpressionError(`"files" is not an expression: choose the file or its folder in the node's Resources tab.`);
   if (!["input", "trigger", "nodes", "run"].includes(root)) throw new ExpressionError(`Unknown source "${root}" in "{{ ${text} }}". Use input, trigger, nodes or run.`);
   if (root === "nodes" && (typeof segments[0] !== "string" || segments[1] !== "output")) {
     throw new ExpressionError(`"{{ ${text} }}" must look like nodes.<id>.output...`);
