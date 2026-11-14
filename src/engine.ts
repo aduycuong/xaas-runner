@@ -6,7 +6,7 @@
 // with one node decides the built-ins that follow it in the same step (the common case), otherwise
 // a `flow:<n>` step does it. A step that leaves nothing more to do ends the run itself.
 
-import type { NeonQueryFunction } from "@neondatabase/serverless";
+import type { Sql } from "./db";
 import {
   emptyState,
   graphSchema,
@@ -28,7 +28,7 @@ import {
 import { judgeNodeOutcome, retryDelay, uuidv7, type NodeOutcome } from "./logic";
 import { newResourceToken, RESOURCE_TOKEN_GRACE_MS } from "./resource-token";
 
-export type Sql = NeonQueryFunction<false, false>;
+export type { Sql };
 
 /** Upstash settings of the step that runs one action node. */
 export type PlanNode = { retries: number; retryDelay: string };

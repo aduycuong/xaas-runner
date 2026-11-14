@@ -4,9 +4,12 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
   "compatibility_flags": ["nodejs_compat"],
-  // Runs near the database instead of near the caller: each step does several queries.
-  "placement": { "mode": "smart" },
+  // Runs next to the database (PlanetScale, aws ap-southeast-1): each step does several queries.
+  // Smart Placement left it where QStash calls from (IAD), ~600 ms per query (2026-11-14).
+  "placement": { "mode": "targeted", "region": "aws:ap-southeast-1" },
   "observability": { "enabled": true },
+  // Warm connections to PlanetScale (cache off); used instead of DATABASE_URL. See the README of the workers folder.
+  "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "c524d196b04e409ea2ad8d9888cde6f9" }],
   // One binding per deployed node version. The binding name is the Worker name in upper case
   // with every other character turned into "_" (bindingName in src/logic.ts).
   // To add a node: deploy the node Worker first, add its binding here, then deploy the runner.
@@ -23,5 +26,7 @@
   }
   // Secrets (wrangler secret put, or .dev.vars locally):
   //   DATABASE_URL, QSTASH_TOKEN, QSTASH_CURRENT_SIGNING_KEY, QSTASH_NEXT_SIGNING_KEY, RUNNER_ADMIN_TOKEN
+  // DATABASE_URL: PlanetScale Postgres, `?sslmode=verify-full` without `sslrootcert` (pg reads that as a file path).
+  // Optional: a Hyperdrive binding named HYPERDRIVE replaces DATABASE_URL (see the README of the workers folder).
   // Optional, for realtime updates to the UI (same values as the app): FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY, FIREBASE_DATABASE_URL
 }
