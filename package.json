@@ -9,15 +9,16 @@
     "test": "tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
-    "@neondatabase/serverless": "^1.2.0",
     "@upstash/qstash": "^2.12.1",
     "@upstash/workflow": "^1.5.0",
     "hono": "^4.13.17",
+    "pg": "^8.23.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261110.1",
     "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "wrangler": "^4.160.0"

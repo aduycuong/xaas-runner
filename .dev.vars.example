@@ -1,10 +1,16 @@
 # Copy to .dev.vars (not committed). Used by wrangler dev.
+# PlanetScale Postgres: ...?sslmode=verify-full (no sslrootcert: pg reads it as a file path).
 DATABASE_URL=
 QSTASH_TOKEN=
 QSTASH_CURRENT_SIGNING_KEY=
 QSTASH_NEXT_SIGNING_KEY=
 # Only when your QStash is not on the default endpoint (regional, or the local dev server).
 # QSTASH_URL=
+# Optional QStash for the workflow steps (same as the ingress); runs keep the QStash they started on.
+# WORKFLOW_QSTASH_URL=
+# WORKFLOW_QSTASH_TOKEN=
+# WORKFLOW_QSTASH_CURRENT_SIGNING_KEY=
+# WORKFLOW_QSTASH_NEXT_SIGNING_KEY=
 # Local only: the public URL of the tunnel that points at wrangler dev, so Upstash calls it back there.
 # UPSTASH_WORKFLOW_URL=https://dev.example.com
 # Bearer token of GET /nodes/<worker name>/health; the deploy script sends it (RUNNER_ADMIN_TOKEN in the app).
