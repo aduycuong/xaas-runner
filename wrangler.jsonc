@@ -21,7 +21,7 @@
     { "binding": "NODE_CORE_ECHO_V1_4_0", "service": "node-core-echo-v1-4-0" }
   ],
   "vars": {
-    "QSTASH_URL": "https://qstash-us-east-1.upstash.io",
+    "QSTASH_URL": "https://qstash-eu-central-1.upstash.io",
     "INGRESS_URL": "https://ingress.xaas.im"
   }
   // Secrets (wrangler secret put, or .dev.vars locally):
