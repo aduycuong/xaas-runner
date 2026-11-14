@@ -64,7 +64,6 @@ npx wrangler secret put RUNNER_ADMIN_TOKEN
 | `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | Upstash console, mục QStash |
 | `RUNNER_ADMIN_TOKEN` | Tự sinh một chuỗi ngẫu nhiên dài; đặt cùng giá trị vào `.env` của app |
 | `QSTASH_URL` (tùy chọn) | Chỉ khi QStash của bạn không ở endpoint mặc định (theo vùng); đặt bằng `wrangler secret put` như trên |
-| `WORKFLOW_QSTASH_URL`, `WORKFLOW_QSTASH_TOKEN`, `WORKFLOW_QSTASH_CURRENT_SIGNING_KEY`, `WORKFLOW_QSTASH_NEXT_SIGNING_KEY` (tùy chọn) | QStash riêng cho các step của workflow, cùng URL và token với ingress. Hiện không đặt: mọi thứ dùng `QSTASH_*` ở EU `eu-central-1` (gần runner ở Singapore hơn US). Runner nhận chữ ký của cả hai bộ key và gửi step tiếp theo về đúng QStash đã ký request, nên run bắt đầu trước khi đổi vẫn chạy xong |
 
 Không đặt `UPSTASH_WORKFLOW_URL` trên Cloudflare: biến đó chỉ dùng ở local khi chạy qua tunnel.
 

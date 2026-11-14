@@ -1,5 +1,4 @@
 import { serve, type WorkflowBindings } from "@upstash/workflow/hono";
-import { Client, Receiver } from "@upstash/qstash";
 import { Hono } from "hono";
 import { connect, databaseUrl } from "./db";
 import { executeAction, failRun, finishWithSkips, loadRun, runBuiltIns, type CallNode } from "./engine";
@@ -19,46 +18,7 @@ type Bindings = WorkflowBindings & RtdbEnv & {
   HYPERDRIVE?: Hyperdrive;
   /** Bearer token of `GET /nodes/:script/health`. The route answers 503 while it is not set. */
   RUNNER_ADMIN_TOKEN?: string;
-  /**
-   * Optional QStash used for the workflow steps only (the same values the ingress uses to start runs).
-   * Without them the steps use QSTASH_URL / QSTASH_TOKEN. Both are accepted: each run keeps the
-   * QStash it was started on (see `workflowQstash`), so runs started before a switch still finish.
-   */
-  WORKFLOW_QSTASH_URL?: string;
-  WORKFLOW_QSTASH_TOKEN?: string;
-  WORKFLOW_QSTASH_CURRENT_SIGNING_KEY?: string;
-  WORKFLOW_QSTASH_NEXT_SIGNING_KEY?: string;
 };
-
-/** True when the JWT `signature` is signed (HS256) with `key`. The body hash is checked later by the receiver. */
-async function signedWith(signature: string, key: string): Promise<boolean> {
-  const [header, payload, mac] = signature.split(".");
-  if (!header || !payload || !mac) return false;
-  const cryptoKey = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
-  const bytes = Uint8Array.from(atob(mac.replace(/-/g, "+").replace(/_/g, "/")), (char) => char.charCodeAt(0));
-  return crypto.subtle.verify("HMAC", cryptoKey, bytes, new TextEncoder().encode(`${header}.${payload}`));
-}
-
-/**
- * QStash client and receiver for one step request. A workflow run lives in the QStash it was started
- * on, so its next steps go back to the one that signed this request: `WORKFLOW_QSTASH_*` when its keys
- * signed it, otherwise `QSTASH_*`.
- */
-async function workflowQstash(env: Bindings, signature: string) {
-  const sets = [
-    { url: env.WORKFLOW_QSTASH_URL, token: env.WORKFLOW_QSTASH_TOKEN, current: env.WORKFLOW_QSTASH_CURRENT_SIGNING_KEY, next: env.WORKFLOW_QSTASH_NEXT_SIGNING_KEY },
-    { url: env.QSTASH_URL, token: env.QSTASH_TOKEN, current: env.QSTASH_CURRENT_SIGNING_KEY, next: env.QSTASH_NEXT_SIGNING_KEY },
-  ].filter((set): set is { url: string | undefined; token: string; current: string; next: string } => Boolean(set.token && set.current && set.next));
-  for (const set of sets) {
-    if ((await signedWith(signature, set.current)) || (await signedWith(signature, set.next))) {
-      return {
-        qstashClient: new Client({ token: set.token, baseUrl: set.url || undefined }),
-        receiver: new Receiver({ currentSigningKey: set.current, nextSigningKey: set.next }),
-      };
-    }
-  }
-  return null;
-}
 
 type NodeFetcher = { fetch: (input: string, init?: RequestInit) => Promise<Response> };
 
@@ -135,8 +95,6 @@ app.post("/run/v3", async (c, next) => {
 });
 
 app.post("/run/v3", async (c) => {
-  const qstash = await workflowQstash(c.env, c.req.header("upstash-signature") ?? "");
-  if (!qstash) return c.json({ error: "invalid_signature" }, 401);
   const timing = createTiming();
   const sql = timing.sql(connect(databaseUrl(c.env)));
   const callNode = timing.callNode(createCallNode(c.env as unknown as Record<string, unknown>));
@@ -186,7 +144,6 @@ app.post("/run/v3", async (c) => {
       });
     },
     {
-      ...qstash,
       // Reached only when Upstash runs out of retries, i.e. for failures around the nodes.
       failureFunction: async ({ context, failStatus, failResponse }) => {
         const message = `${failStatus}: ${failResponse}`.slice(0, 500);
