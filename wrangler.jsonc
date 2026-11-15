@@ -20,7 +20,11 @@
     { "binding": "NODE_CORE_ECHO_V1_3_0", "service": "node-core-echo-v1-3-0" },
     { "binding": "NODE_CORE_ECHO_V1_4_0", "service": "node-core-echo-v1-4-0" },
     { "binding": "NODE_CORE_DELAY_V1_0_0", "service": "node-core-delay-v1-0-0" },
-    { "binding": "NODE_CORE_POLL_DELAY_V1_0_0", "service": "node-core-poll-delay-v1-0-0" }
+    { "binding": "NODE_CORE_POLL_DELAY_V1_0_0", "service": "node-core-poll-delay-v1-0-0" },
+    { "binding": "NODE_HTTP_REQUEST_V1_0_0", "service": "node-http-request-v1-0-0" },
+    { "binding": "NODE_DATA_TRANSFORM_V1_0_0", "service": "node-data-transform-v1-0-0" },
+    { "binding": "NODE_AI_LLM_V1_0_0", "service": "node-ai-llm-v1-0-0" },
+    { "binding": "NODE_NOTIFY_EMAIL_V1_0_0", "service": "node-notify-email-v1-0-0" }
   ],
   "vars": {
     "QSTASH_URL": "https://qstash-eu-central-1.upstash.io",
