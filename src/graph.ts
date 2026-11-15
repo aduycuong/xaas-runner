@@ -63,8 +63,10 @@ const settingsSchema = z
     timeout: z.int().positive().nullable().default(null),
     /** Max attempts; null inherits the node definition. */
     maxAttempts: z.int().min(1).max(10).nullable().default(null),
+    /** Async nodes: milliseconds from the 202 to the result; null inherits the node definition. Ignored for sync nodes. */
+    maxWait: z.int().positive().nullable().default(null),
   })
-  .default({ onError: "stop", timeout: null, maxAttempts: null });
+  .default({ onError: "stop", timeout: null, maxAttempts: null, maxWait: null });
 
 const triggerNode = z.object({
   id: nodeIdSchema,

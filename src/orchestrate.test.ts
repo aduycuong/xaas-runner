@@ -40,6 +40,22 @@ function harness(options: { fail?: string[] } = {}) {
     async finish(status, skips) {
       finished.push({ status, skips });
     },
+    async sleep(name) {
+      log.push(name);
+    },
+    async waitForEvent(name) {
+      log.push(name);
+      return { timeout: false };
+    },
+    async startAsync(id) {
+      return { kind: "ended", result: { ends: [{ id, status: "succeeded" }], finished: false } };
+    },
+    async completeAsync(id) {
+      return { kind: "ended", result: { ends: [{ id, status: "succeeded" }], finished: false } };
+    },
+    async pollAsync(id) {
+      return { kind: "ended", result: { ends: [{ id, status: "succeeded" }], finished: false } };
+    },
   };
   let decide: ((wire: Parameters<Deps["runBuiltIns"]>[0]) => StepResult) | null = null;
   return { log, finished, deps, setDecide: (fn: typeof decide) => (decide = fn) };
@@ -97,4 +113,86 @@ test("orchestrate: a plan that failed to load is finished as failed", async () =
   await orchestrate({ ok: false, error: { code: "INVALID_DEFINITION", message: "bad" } }, h.deps);
   assert.deepEqual(h.log, ["finish"]);
   assert.equal(h.finished[0].status, "failed");
+});
+
+// ---------------------------------------------------------------------------
+// Async nodes
+// ---------------------------------------------------------------------------
+
+const callbackPlan = { completion: "callback" as const, maxAttempts: 3, timeoutMs: 30_000, maxWaitMs: 600_000, backoff: "none", baseDelayMs: 2_000, callbackHandler: false };
+const pollingPlan = { ...callbackPlan, completion: "polling" as const, poll: { intervalMs: 1_000, maxIntervalMs: 2_000, maxPolls: 10 } };
+
+function asyncPlanOf(raw: unknown, asyncNodes: Record<string, typeof callbackPlan | typeof pollingPlan>) {
+  const plan = planOf(raw);
+  for (const [id, config] of Object.entries(asyncNodes)) plan.nodes[id] = { ...plan.nodes[id], async: config };
+  return plan;
+}
+
+const ok = (id: string): StepResult => ({ ends: [{ id, status: "succeeded" }], finished: false });
+
+test("orchestrate: an async callback node sends, waits for its event, then reads the callback", async () => {
+  const h = harness();
+  const waited: string[] = [];
+  h.deps.startAsync = async () => ({ kind: "accepted", nodeRunId: "nr1" });
+  h.deps.waitForEvent = async (name, eventId) => {
+    h.log.push(name);
+    waited.push(eventId);
+    return { timeout: false };
+  };
+  h.deps.completeAsync = async (id) => ({ kind: "ended", result: ok(id) });
+  await orchestrate(asyncPlanOf({ nodes: [trigger, action("a"), action("b")], edges: [edge("t", "a"), edge("a", "b")] }, { a: callbackPlan }), h.deps);
+  assert.deepEqual(h.log, ["node:a:1", "wait:a:1", "done:a:1", "node:b", "finish"]);
+  assert.deepEqual(waited, ["callback-nr1-1"]);
+});
+
+test("orchestrate: a polling node sleeps longer each time, and follows retry_after_ms", async () => {
+  const h = harness();
+  const sleeps: [string, number][] = [];
+  h.deps.sleep = async (name, ms) => {
+    h.log.push(name);
+    sleeps.push([name, ms]);
+  };
+  h.deps.startAsync = async () => ({ kind: "accepted", nodeRunId: "nr1" });
+  let polls = 0;
+  h.deps.pollAsync = async (id) => {
+    polls++;
+    if (polls === 1) return { kind: "running", errors: 0 };
+    if (polls === 2) return { kind: "running", errors: 0 };
+    if (polls === 3) return { kind: "running", errors: 1, retryAfterMs: 5_000 };
+    return { kind: "ended", result: ok(id) };
+  };
+  await orchestrate(asyncPlanOf({ nodes: [trigger, action("a")], edges: [edge("t", "a")] }, { a: pollingPlan }), h.deps);
+  assert.deepEqual(h.log, ["node:a:1", "poll:a:1:1", "check:a:1:1", "poll:a:1:2", "check:a:1:2", "poll:a:1:3", "check:a:1:3", "poll:a:1:4", "check:a:1:4", "finish"]);
+  assert.deepEqual(sleeps.map(([, ms]) => ms), [1_000, 1_500, 2_000, 5_000]);
+});
+
+test("orchestrate: a retryable async failure sleeps, then the next attempt has its own steps", async () => {
+  const h = harness();
+  const attempts: number[] = [];
+  h.deps.startAsync = async (_id, attempt) => {
+    attempts.push(attempt);
+    return attempt === 1 ? { kind: "accepted", nodeRunId: "nr1" } : { kind: "accepted", nodeRunId: "nr1" };
+  };
+  h.deps.completeAsync = async (id, attempt) => (attempt === 1 ? { kind: "retry", delayMs: 2_000 } : { kind: "ended", result: ok(id) });
+  await orchestrate(asyncPlanOf({ nodes: [trigger, action("a")], edges: [edge("t", "a")] }, { a: callbackPlan }), h.deps);
+  assert.deepEqual(h.log, ["node:a:1", "wait:a:1", "done:a:1", "backoff:a:1", "node:a:2", "wait:a:2", "done:a:2", "finish"]);
+  assert.deepEqual(attempts, [1, 2]);
+});
+
+test("orchestrate: an async node runs alongside a sync node of the same wave, and only the first step records skips", async () => {
+  const h = harness();
+  const skipsSeen: string[][] = [];
+  h.deps.startAsync = async (_id, attempt, _plan, options) => {
+    skipsSeen.push(options.skips);
+    return attempt === 1 ? { kind: "retry", delayMs: 1_000 } : { kind: "accepted", nodeRunId: "nr1" };
+  };
+  h.deps.completeAsync = async (id) => ({ kind: "ended", result: ok(id) });
+  await orchestrate(
+    asyncPlanOf({ nodes: [trigger, action("a"), action("b"), action("c")], edges: [edge("t", "a"), edge("t", "b"), edge("a", "c"), edge("b", "c")] }, { a: callbackPlan }),
+    h.deps,
+  );
+  assert.ok(h.log.includes("node:b"));
+  assert.deepEqual(h.log.filter((name) => name.endsWith(":a:1") || name.endsWith(":a:2")), ["node:a:1", "backoff:a:1", "node:a:2", "wait:a:2", "done:a:2"]);
+  assert.equal(h.log.at(-2), "node:c");
+  assert.deepEqual(skipsSeen.slice(1), [[]]);
 });

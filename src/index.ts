@@ -1,7 +1,19 @@
 import { serve, type WorkflowBindings } from "@upstash/workflow/hono";
 import { Hono } from "hono";
 import { connect, databaseUrl } from "./db";
-import { executeAction, failRun, finishWithSkips, loadRun, runBuiltIns, type CallNode } from "./engine";
+import {
+  completeAsyncAttempt,
+  executeAction,
+  failRun,
+  finishWithSkips,
+  loadRun,
+  pollAsyncAttempt,
+  runBuiltIns,
+  startAsyncAttempt,
+  type AsyncEnv,
+  type AsyncStep,
+  type CallNode,
+} from "./engine";
 import { bindingName } from "./logic";
 import { publishRunFinished } from "./notify";
 import { orchestrate } from "./orchestrate";
@@ -18,7 +30,19 @@ type Bindings = WorkflowBindings & RtdbEnv & {
   HYPERDRIVE?: Hyperdrive;
   /** Bearer token of `GET /nodes/:script/health`. The route answers 503 while it is not set. */
   RUNNER_ADMIN_TOKEN?: string;
+  /** Signs the callback URLs of async nodes; the same value as the ingress (which checks them). */
+  CALLBACK_SIGNING_KEY?: string;
+  /** Derives the run tokens of async attempts (engine.ts, derivedResourceToken). Runner only. */
+  RESOURCE_TOKEN_SECRET?: string;
 };
+
+/** What async nodes need; a run that reaches one without it fails with a clear message. */
+function asyncEnv(env: Bindings): AsyncEnv {
+  if (!env.INGRESS_URL || !env.CALLBACK_SIGNING_KEY || !env.RESOURCE_TOKEN_SECRET) {
+    throw new Error("Async nodes need INGRESS_URL, CALLBACK_SIGNING_KEY and RESOURCE_TOKEN_SECRET on the runner.");
+  }
+  return { ingressUrl: env.INGRESS_URL, callbackSigningKey: env.CALLBACK_SIGNING_KEY, resourceTokenSecret: env.RESOURCE_TOKEN_SECRET };
+}
 
 type NodeFetcher = { fetch: (input: string, init?: RequestInit) => Promise<Response> };
 
@@ -36,8 +60,8 @@ function createCallNode(env: Record<string, unknown>): CallNode {
     let response: Response;
     try {
       // The host is ignored: a service binding always reaches the bound Worker.
-      response = await (binding as NodeFetcher).fetch("https://node.internal/", {
-        method: "POST",
+      response = await (binding as NodeFetcher).fetch(`https://node.internal${call.path ?? "/"}`, {
+        method: call.method ?? "POST",
         headers: call.headers,
         body: call.body,
         signal: AbortSignal.timeout(call.timeoutMs),
@@ -82,19 +106,21 @@ app.get("/nodes/:script/health", async (c) => {
  * again from the top each time (see `orchestrate`).
  *
  * Step names and their order are a contract with runs in flight. A change to either needs a
- * new route (`/run/v4`), with this one kept until its runs have ended.
+ * new route (`/run/v5`), with this one kept until its runs have ended.
  *
- * v3 runs the workflow graph: `load`, then waves of `node:<id>` steps (parallel inside a wave),
- * `flow:<n>` for if / switch / merge that need a step of their own, and `finish` when no node step
- * ended the run.
+ * v4 runs the workflow graph: `load`, then waves of node steps (parallel inside a wave), `flow:<n>`
+ * for if / switch / merge that need a step of their own, and `finish` when no node step ended the run.
+ * A sync node is one step `node:<id>`. An async node runs attempts: `node:<id>:<n>`, then `wait:<id>:<n>`
+ * + `done:<id>:<n>` (callback) or `poll:<id>:<n>:<k>` + `check:<id>:<n>:<k>` (polling), and
+ * `backoff:<id>:<n>` before a retry. (v3 was the same without async nodes.)
  */
-app.post("/run/v3", async (c, next) => {
+app.post("/run/v4", async (c, next) => {
   // The Upstash SDK answers an unsigned call with a 500 and a stack trace; refuse it plainly first.
   if (!c.req.header("upstash-signature")) return c.json({ error: "missing_signature" }, 401);
   await next();
 });
 
-app.post("/run/v3", async (c) => {
+app.post("/run/v4", async (c) => {
   const timing = createTiming();
   const sql = timing.sql(connect(databaseUrl(c.env)));
   const callNode = timing.callNode(createCallNode(c.env as unknown as Record<string, unknown>));
@@ -118,6 +144,14 @@ app.post("/run/v3", async (c) => {
       };
       const skipped = (ids: string[]) => ids.forEach((id) => events?.nodeEnded(id, "skipped"));
       const ended = (ends: { id: string; status: string }[]) => ends.forEach((end) => events?.nodeEnded(end.id, end.status));
+      /** Realtime updates once an async node's step ended it. */
+      const asyncEnded = (step: AsyncStep): AsyncStep => {
+        if (step.kind !== "ended") return step;
+        ended(step.result.ends);
+        if (step.result.failed) endRun("failed");
+        else if (step.result.finished && !step.result.ends.some((end) => end.status === "cancelled")) endRun("succeeded");
+        return step;
+      };
 
       await orchestrate(plan, {
         step: (name, fn, settings) => context.run(name, () => timing.step(name, fn), settings),
@@ -141,6 +175,22 @@ app.post("/run/v3", async (c) => {
           await finishWithSkips(sql, runId, status, skips, error);
           endRun(status);
         },
+        sleep: (name, ms) => context.sleep(name, Math.max(1, Math.ceil(ms / 1000))),
+        waitForEvent: async (name, eventId, timeoutMs) => {
+          const event = await context.waitForEvent(name, eventId, { timeout: Math.max(1, Math.ceil(timeoutMs / 1000)) });
+          return { timeout: event.timeout };
+        },
+        startAsync: async (nodeId, attempt, asyncPlan, options) => {
+          if (attempt === 1) {
+            events?.nodeRunning(nodeId);
+            skipped(options.skips);
+          }
+          return asyncEnded(await startAsyncAttempt(sql, asyncEnv(c.env), runId, nodeId, attempt, asyncPlan, callNode, options));
+        },
+        completeAsync: async (nodeId, attempt, asyncPlan, timedOut, options) =>
+          asyncEnded(await completeAsyncAttempt(sql, asyncEnv(c.env), runId, nodeId, attempt, asyncPlan, callNode, timedOut, options)),
+        pollAsync: async (nodeId, attempt, poll, errors, asyncPlan, options) =>
+          asyncEnded(await pollAsyncAttempt(sql, asyncEnv(c.env), runId, nodeId, attempt, poll, errors, asyncPlan, callNode, options)),
       });
     },
     {

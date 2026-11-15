@@ -16,7 +16,7 @@ export type NodeOutcome =
   | { kind: "unavailable"; message: string };
 
 export type NodeVerdict =
-  | { ok: true; output: Record<string, unknown>; httpStatus: number }
+  | { ok: true; output: Record<string, unknown>; httpStatus: number | null }
   | { ok: false; retryable: boolean; error: StoredError; httpStatus: number | null };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -59,6 +59,52 @@ export function judgeNodeOutcome(outcome: NodeOutcome): NodeVerdict {
       message: typeof reported.message === "string" ? reported.message : `The node answered ${status}.`,
     },
   };
+}
+
+function reportedError(value: unknown, fallbackCode: string, retryableByDefault: boolean): { retryable: boolean; error: StoredError } {
+  const reported = isRecord(value) ? value : {};
+  return {
+    retryable: typeof reported.retryable === "boolean" ? reported.retryable : retryableByDefault,
+    error: {
+      code: typeof reported.code === "string" ? reported.code : fallbackCode,
+      message: typeof reported.message === "string" ? reported.message : "The node reported an error.",
+    },
+  };
+}
+
+/** A callback body without a handler on the node: `{ output }` or `{ error }`. A reported error is final unless it says `retryable`. */
+export function judgeCallbackBody(body: unknown): NodeVerdict {
+  if (isRecord(body) && isRecord(body.output)) return { ok: true, output: body.output, httpStatus: null };
+  if (isRecord(body) && isRecord(body.error)) return { ok: false, httpStatus: null, ...reportedError(body.error, "NODE_FAILED", false) };
+  return { ok: false, retryable: false, httpStatus: null, error: { code: "INVALID_CALLBACK", message: 'The callback had neither an "output" nor an "error" object.' } };
+}
+
+/** What a polling node's status route said. */
+export type PollVerdict = { kind: "running"; retryAfterMs?: number } | { kind: "ended"; verdict: NodeVerdict } | { kind: "unreachable"; error: StoredError };
+
+/** Applies the protocol to one answer of a status route: `{ status: "running" | "succeeded" | "failed", … }`. */
+export function judgePollOutcome(outcome: NodeOutcome): PollVerdict {
+  if (outcome.kind !== "response" || outcome.status < 200 || outcome.status >= 300) {
+    const verdict = judgeNodeOutcome(outcome);
+    if (!verdict.ok && verdict.retryable) return { kind: "unreachable", error: verdict.error };
+    if (!verdict.ok) return { kind: "ended", verdict };
+  }
+  const body = outcome.kind === "response" ? outcome.body : null;
+  const status = isRecord(body) ? body.status : undefined;
+  if (status === "running") {
+    const retryAfter = isRecord(body) && typeof body.retry_after_ms === "number" && body.retry_after_ms > 0 ? body.retry_after_ms : undefined;
+    return { kind: "running", ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) };
+  }
+  if (status === "succeeded" && isRecord(body) && isRecord(body.output)) return { kind: "ended", verdict: { ok: true, output: body.output, httpStatus: 200 } };
+  if (status === "failed" && isRecord(body)) return { kind: "ended", verdict: { ok: false, httpStatus: 200, ...reportedError(body.error, "NODE_FAILED", false) } };
+  return { kind: "ended", verdict: { ok: false, retryable: false, httpStatus: 200, error: { code: "INVALID_STATUS", message: 'The status route answered without a valid "status".' } } };
+}
+
+/** Milliseconds before attempt `attempt + 1`, after attempt `attempt` failed (the same as the Upstash `retryDelay` of sync nodes). */
+export function retryDelayMs(backoff: string, baseDelayMs: number, attempt: number): number {
+  if (backoff === "linear") return baseDelayMs * attempt;
+  if (backoff === "exponential") return baseDelayMs * 2 ** (attempt - 1);
+  return baseDelayMs;
 }
 
 /**

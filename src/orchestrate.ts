@@ -3,7 +3,8 @@
 // must give the same answer each time: no clock, no database, only what the steps returned.
 
 import { planNext, startState, type Graph, type NodeStatus, type StoredError } from "./graph";
-import { toWire, type NodeEnd, type PlanNode, type RunPlan, type StepResult, type WireState } from "./engine";
+import { ASYNC_STEP, toWire, type AsyncPlan, type AsyncStep, type NodeEnd, type PlanNode, type RunPlan, type StepResult, type WireState } from "./engine";
+import { nextPollWait } from "./limits";
 
 export type StepOptions = { wire: WireState; solo: boolean; skips: string[] };
 
@@ -13,7 +14,52 @@ export type Deps = {
   executeAction(nodeId: string, options: StepOptions): Promise<StepResult>;
   runBuiltIns(wire: WireState, skips: string[]): Promise<StepResult>;
   finish(status: "succeeded" | "failed", skips: string[], error?: StoredError): Promise<void>;
+  /** `context.sleep` of Upstash: no Worker runs while it waits. */
+  sleep(name: string, ms: number): Promise<void>;
+  /** `context.waitForEvent` of Upstash: resolves when the event comes (`timeout: false`) or after `timeoutMs`. */
+  waitForEvent(name: string, eventId: string, timeoutMs: number): Promise<{ timeout: boolean }>;
+  /** Steps of an async node (engine.ts): send the job, read the callback, poll the job. */
+  startAsync(nodeId: string, attempt: number, plan: AsyncPlan, options: StepOptions): Promise<AsyncStep>;
+  completeAsync(nodeId: string, attempt: number, plan: AsyncPlan, timedOut: boolean, options: StepOptions): Promise<AsyncStep>;
+  pollAsync(nodeId: string, attempt: number, poll: number, errors: number, plan: AsyncPlan, options: StepOptions): Promise<AsyncStep>;
 };
+
+/**
+ * The attempts of one async node. Each attempt sends the job (`node:<id>:<n>`), then either waits for the callback
+ * (`wait:<id>:<n>`) and reads it (`done:<id>:<n>`), or sleeps and polls (`poll:<id>:<n>:<k>` + `check:<id>:<n>:<k>`).
+ * A failure that may be retried sleeps (`backoff:<id>:<n>`) before the next attempt.
+ */
+async function runAsyncNode(deps: Deps, id: string, plan: AsyncPlan, first: StepOptions): Promise<StepResult> {
+  for (let attempt = 1; ; attempt++) {
+    // Skipped nodes are recorded by the first step only.
+    const options = attempt === 1 ? first : { ...first, skips: [] };
+    let result: AsyncStep = await deps.step(`node:${id}:${attempt}`, () => deps.startAsync(id, attempt, plan, options), ASYNC_STEP);
+    if (result.kind === "accepted") {
+      if (plan.completion === "callback") {
+        const event = await deps.waitForEvent(`wait:${id}:${attempt}`, `callback-${result.nodeRunId}-${attempt}`, plan.maxWaitMs);
+        result = await deps.step(`done:${id}:${attempt}`, () => deps.completeAsync(id, attempt, plan, event.timeout, options), ASYNC_STEP);
+      } else {
+        const poll = plan.poll ?? { intervalMs: 5_000, maxIntervalMs: 60_000, maxPolls: 200 };
+        let wait = poll.intervalMs;
+        let errors = 0;
+        for (let k = 1; ; k++) {
+          await deps.sleep(`poll:${id}:${attempt}:${k}`, wait);
+          const pollErrors = errors;
+          result = await deps.step(`check:${id}:${attempt}:${k}`, () => deps.pollAsync(id, attempt, k, pollErrors, plan, options), ASYNC_STEP);
+          if (result.kind !== "running") break;
+          errors = result.errors;
+          wait = nextPollWait(wait, poll.maxIntervalMs, result.retryAfterMs);
+        }
+      }
+    }
+    if (result.kind === "ended") return result.result;
+    if (result.kind === "retry") {
+      await deps.sleep(`backoff:${id}:${attempt}`, result.delayMs);
+      continue;
+    }
+    throw new Error(`Unexpected step result "${result.kind}" for async node "${id}".`);
+  }
+}
 
 function apply(state: ReturnType<typeof startState>, ends: NodeEnd[]) {
   for (const end of ends) {
@@ -59,9 +105,12 @@ export async function orchestrate(plan: Extract<RunPlan, { ok: true }> | { ok: f
     const skips = pendingSkips;
     pendingSkips = [];
     const results = await Promise.all(
-      actions.map((id, index) =>
-        deps.step(`node:${id}`, () => deps.executeAction(id, { wire, solo, skips: index === 0 ? skips : [] }), plan.nodes[id]),
-      ),
+      actions.map((id, index) => {
+        const options = { wire, solo, skips: index === 0 ? skips : [] };
+        const asyncPlan = plan.nodes[id]?.async;
+        if (asyncPlan) return runAsyncNode(deps, id, asyncPlan, options);
+        return deps.step(`node:${id}`, () => deps.executeAction(id, options), plan.nodes[id]);
+      }),
     );
     for (const result of results) {
       apply(state, result.ends);

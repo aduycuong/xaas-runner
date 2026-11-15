@@ -18,3 +18,15 @@ export async function newResourceToken(): Promise<{ token: string; hash: string 
   const token = `xrb_${toBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
   return { token, hash: await hashResourceToken(token) };
 }
+
+/**
+ * The run token of an attempt of an async node, derived from the attempt id with RESOURCE_TOKEN_SECRET: the runner calls
+ * the node more than once in one attempt (`POST /callback`, the status route) and can make the same token again in each
+ * step without keeping it anywhere. Stored and checked like a random one (`hashResourceToken`).
+ */
+export async function derivedResourceToken(secret: string, attemptId: string): Promise<{ token: string; hash: string }> {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`resource-token:${attemptId}`)));
+  const token = `xrb_${toBase64Url(mac)}`;
+  return { token, hash: await hashResourceToken(token) };
+}

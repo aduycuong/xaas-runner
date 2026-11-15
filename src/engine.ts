@@ -6,7 +6,8 @@
 // with one node decides the built-ins that follow it in the same step (the common case), otherwise
 // a `flow:<n>` step does it. A step that leaves nothing more to do ends the run itself.
 
-import type { Sql } from "./db";
+import { callbackUrl } from "./callback-url";
+import type { Query, Sql } from "./db";
 import {
   emptyState,
   graphSchema,
@@ -25,13 +26,32 @@ import {
   type Scope,
   type StoredError,
 } from "./graph";
-import { judgeNodeOutcome, retryDelay, uuidv7, type NodeOutcome } from "./logic";
-import { newResourceToken, RESOURCE_TOKEN_GRACE_MS } from "./resource-token";
+import { clampToRange, MAX_ATTEMPTS, MAX_WAIT_MS, POLL_ERRORS_IN_A_ROW, TIMEOUT_MS } from "./limits";
+import { judgeCallbackBody, judgeNodeOutcome, judgePollOutcome, retryDelay, retryDelayMs, uuidv7, type NodeOutcome, type NodeVerdict } from "./logic";
+import { derivedResourceToken, newResourceToken, RESOURCE_TOKEN_GRACE_MS } from "./resource-token";
 
 export type { Sql };
 
-/** Upstash settings of the step that runs one action node. */
-export type PlanNode = { retries: number; retryDelay: string };
+/** How an async node's attempts run: its manifest's settings with the workflow's, clamped to the shared ranges. */
+export type AsyncPlan = {
+  completion: "callback" | "polling";
+  maxAttempts: number;
+  timeoutMs: number;
+  maxWaitMs: number;
+  backoff: string;
+  baseDelayMs: number;
+  callbackHandler: boolean;
+  poll?: { intervalMs: number; maxIntervalMs: number; maxPolls: number };
+};
+
+/** Upstash settings of the step that runs one action node; `async` for an async node. */
+export type PlanNode = { retries: number; retryDelay: string; async?: AsyncPlan };
+
+/** Upstash settings of every step of an async node: its attempts are counted by the runner, these only cover failures around the call. */
+export const ASYNC_STEP: PlanNode = { retries: 2, retryDelay: "2000 * (1 + retried)" };
+
+/** A callback URL stays valid this long after the attempt's max wait, for a callback that arrives at the last moment. */
+const CALLBACK_URL_GRACE_S = 3600;
 
 /**
  * Result of the `load` step. Upstash sends it back on every later request of the run, so it holds
@@ -45,8 +65,11 @@ export type NodeCall = {
   scriptName: string;
   transport: string;
   headers: Record<string, string>;
-  body: string;
+  body?: string;
   timeoutMs: number;
+  /** The node's own path; `/` (run the node) when not given. */
+  path?: string;
+  method?: "GET" | "POST";
 };
 export type CallNode = (call: NodeCall) => Promise<NodeOutcome>;
 
@@ -140,7 +163,7 @@ export async function loadRun(sql: Sql, runId: string): Promise<RunPlan> {
   const keys = [...new Set(actions.map((node) => node.data.nodeKey))];
   const versions = keys.length
     ? await sql`
-        select n.key, nv.version, nv.retry_max_attempts, nv.retry_backoff, nv.retry_base_delay_ms
+        select n.key, nv.version, nv.retry_max_attempts, nv.retry_backoff, nv.retry_base_delay_ms, nv.timeout_ms, nv.mode, nv.async
         from node_versions nv join nodes n on n.id = nv.node_id
         where n.key = any(${keys}::text[])`
     : [];
@@ -159,7 +182,24 @@ export async function loadRun(sql: Sql, runId: string): Promise<RunPlan> {
         error: { code: "NODE_VERSION_NOT_FOUND", message: `Node "${node.id}" uses ${node.data.nodeKey}@${node.data.version}, which is not registered.` },
       };
     }
-    const attempts = node.data.settings.maxAttempts ?? version.retry_max_attempts;
+    const attempts = clampToRange(node.data.settings.maxAttempts ?? version.retry_max_attempts, MAX_ATTEMPTS);
+    if (version.mode === "async" && version.async) {
+      const config = version.async as { completion: "callback" | "polling"; maxWaitMs: number; callbackHandler?: boolean; poll?: AsyncPlan["poll"] };
+      nodes[node.id] = {
+        ...ASYNC_STEP,
+        async: {
+          completion: config.completion,
+          maxAttempts: attempts,
+          timeoutMs: clampToRange(node.data.settings.timeout ?? version.timeout_ms, TIMEOUT_MS),
+          maxWaitMs: clampToRange(node.data.settings.maxWait ?? config.maxWaitMs, MAX_WAIT_MS),
+          backoff: version.retry_backoff,
+          baseDelayMs: version.retry_base_delay_ms,
+          callbackHandler: config.callbackHandler === true,
+          ...(config.completion === "polling" && config.poll ? { poll: config.poll } : {}),
+        },
+      };
+      continue;
+    }
     nodes[node.id] = { retries: Math.max(0, attempts - 1) + INFRA_RETRIES, retryDelay: retryDelay(version.retry_backoff, version.retry_base_delay_ms) };
   }
   return { ok: true, graph, triggerId: run.trigger_id ?? null, nodes, info: { workspaceId: run.workspace_id, workflowId: run.workflow_id, no: Number(run.no), test: run.test != null } };
@@ -334,13 +374,22 @@ async function failRunAt(sql: Sql, runId: string, nodeRunId: string | null, erro
   await sql.transaction(queries);
 }
 
-/**
- * Runs one action node; the body of the `node:<id>` step. A failed attempt that may be tried again
- * throws, so Upstash retries the step. A final failure ends the run and is returned, not thrown.
- */
-export async function executeAction(sql: Sql, runId: string, nodeId: string, callNode: CallNode, options: ActionOptions): Promise<StepResult> {
+/** What every step of one action node reads first. */
+type ActionScope = {
+  runId: string;
+  run: RunRow;
+  nodeRuns: NodeRunRow[];
+  graph: Graph;
+  node: ActionNode;
+  label: string;
+  /** Skipped nodes this step records with its first write. */
+  skipRows: Query[];
+};
+
+/** Reads the run and the node; ends the step when there is nothing to do (run gone, node gone, run over). */
+async function beginAction(sql: Sql, runId: string, nodeId: string, skips: string[]): Promise<{ ended: StepResult } | { scope: ActionScope }> {
   const read = await readRun(sql, runId);
-  if (!read) return { ends: [], finished: true, failed: { code: "RUN_NOT_FOUND", message: `Run ${runId} does not exist.` } };
+  if (!read) return { ended: { ends: [], finished: true, failed: { code: "RUN_NOT_FOUND", message: `Run ${runId} does not exist.` } } };
   const { run, nodeRuns } = read;
   const { graph } = graphOfRun(run.definition, run.test);
   if (!graph) throw new Error("The definition was valid at load time.");
@@ -348,36 +397,117 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
   if (!node || node.type !== "action") {
     const error = { code: "NODE_NOT_FOUND", message: `Node "${nodeId}" is not an action of the workflow.` };
     await failRunAt(sql, runId, null, error);
-    return { ends: [{ id: nodeId, status: "failed" }], finished: true, failed: error };
+    return { ended: { ends: [{ id: nodeId, status: "failed" }], finished: true, failed: error } };
   }
-
-  const skipRows = writeNodeRuns(sql, runId, rowsForSkipped(graph, options.skips));
+  const skipRows = writeNodeRuns(sql, runId, rowsForSkipped(graph, skips));
   const label = node.data.label ?? node.id;
-
-  // A sibling branch failed while this step was waiting to start: do not call the node.
+  // A sibling branch failed (or the run was cancelled) while this step was waiting to start: do not call the node.
   if (run.status === "failed" || run.status === "cancelled") {
     await sql.transaction([...skipRows, ...writeNodeRuns(sql, runId, [{ id: nodeId, type: "action", label, status: "cancelled" }])]);
-    return { ends: [{ id: nodeId, status: "cancelled" }], finished: true };
+    return { ended: { ends: [{ id: nodeId, status: "cancelled" }], finished: true } };
   }
+  return { scope: { runId, run, nodeRuns, graph, node, label, skipRows } };
+}
 
+/** How one attempt ended, once recorded. */
+type Settled = { kind: "ok"; end: NodeEnd; nodeOutput: unknown } | { kind: "retry" } | { kind: "ended"; result: StepResult };
+
+/**
+ * Records the verdict on an attempt: the attempt, and when it is the last word, the node run. A retryable failure with
+ * attempts left only records the attempt. `stored` replaces what the attempt keeps of the request and response.
+ */
+async function settleAttempt(
+  sql: Sql,
+  scope: ActionScope,
+  nodeRunId: string,
+  attempt: number,
+  maxAttempts: number,
+  verdict: NodeVerdict,
+  stored: { request?: string; response?: string },
+): Promise<Settled> {
+  const { runId, node, skipRows } = scope;
+  const request = stored.request ?? null;
+  const response = stored.response ?? null;
+  if (verdict.ok) {
+    const status: NodeStatus = attempt > 1 ? "warning" : "succeeded";
+    await sql.transaction([
+      ...skipRows,
+      sql`update attempts set status = 'succeeded', http_status = coalesce(${verdict.httpStatus}::int, http_status), request = coalesce(${request}::jsonb, request),
+            response = coalesce(${response}::jsonb, response), finished_at = now()
+          where node_run_id = ${nodeRunId} and attempt = ${attempt}`,
+      sql`update node_runs set status = ${status}, output = ${json(verdict.output)}::jsonb, attempt_count = ${attempt}, finished_at = now() where id = ${nodeRunId}`,
+      sql`insert into run_logs (id, run_id, node_run_id, level, message) values (${uuidv7()}, ${runId}, ${nodeRunId}, 'info', ${attempt > 1 ? `Succeeded on attempt ${attempt}` : "Succeeded"})`,
+    ]);
+    return { kind: "ok", end: { id: node.id, status }, nodeOutput: verdict.output };
+  }
+  const error = json(verdict.error);
+  const attemptRow = sql`
+    update attempts set status = 'failed', http_status = coalesce(${verdict.httpStatus}::int, http_status), error = ${error}::jsonb,
+      request = coalesce(${request}::jsonb, request), response = coalesce(${response}::jsonb, response), finished_at = now()
+    where node_run_id = ${nodeRunId} and attempt = ${attempt}`;
+  const log = sql`insert into run_logs (id, run_id, node_run_id, level, message) values (${uuidv7()}, ${runId}, ${nodeRunId}, 'warn', ${`Attempt ${attempt} failed: ${verdict.error.message}`})`;
+  if (verdict.retryable && attempt < maxAttempts) {
+    await sql.transaction([...skipRows, attemptRow, log]);
+    return { kind: "retry" };
+  }
+  if (node.data.settings.onError === "continue") {
+    // The run goes on with this node's output as null.
+    await sql.transaction([
+      ...skipRows,
+      attemptRow,
+      log,
+      sql`update node_runs set status = 'warning', error = ${error}::jsonb, output = 'null'::jsonb, attempt_count = ${attempt}, finished_at = now() where id = ${nodeRunId}`,
+    ]);
+    return { kind: "ok", end: { id: node.id, status: "warning" }, nodeOutput: null };
+  }
+  await sql.transaction([...skipRows, attemptRow, log]);
+  return { kind: "ended", result: await finishAfterFailure(sql, scope.runId, node, verdict.error, nodeRunId) };
+}
+
+/** After a node ended well: alone in its wave, the step also decides what follows and may end the run. */
+async function afterNodeEnd(sql: Sql, scope: ActionScope, end: NodeEnd, nodeOutput: unknown, options: ActionOptions): Promise<StepResult> {
+  const ends: NodeEnd[] = [end];
+  if (!options.solo) return { ends, finished: false };
+
+  const state = fromWire(options.wire);
+  state.status.set(scope.node.id, end.status);
+  const { scope: exprScope, outputs } = buildScope(scope.run, scope.runId, scope.nodeRuns, { [scope.node.id]: nodeOutput });
+  const decided = decideBuiltIns(scope.graph, state, exprScope, outputs);
+  ends.push(...decided.ends);
+  const rows = [...rowsForSkipped(scope.graph, decided.skipped), ...decided.writes];
+  const queries = writeNodeRuns(sql, scope.runId, rows);
+  if (queries.length) await sql.transaction(queries);
+
+  if (decided.readyActions.length === 0) {
+    await finishRun(sql, scope.runId, "succeeded");
+    return { ends, finished: true };
+  }
+  return { ends, finished: false };
+}
+
+/** What happens before a node is called, the same for sync and async: done already, pinned, or what to call it with. */
+type Prepared =
+  | { kind: "end"; end: NodeEnd; nodeOutput: unknown }
+  | { kind: "failure"; failure: StoredError }
+  | { kind: "ended"; result: StepResult }
+  | { kind: "call"; version: VersionRow; input: Record<string, unknown> };
+
+async function prepareCall(sql: Sql, scope: ActionScope): Promise<Prepared> {
+  const { runId, run, nodeRuns, node, label, skipRows } = scope;
+  const nodeId = node.id;
   const existing = nodeRuns.find((row) => row.node_id === nodeId);
-  let end: NodeEnd | null = null;
-  let nodeOutput: unknown;
-  let failure: StoredError | null = null;
-
   if (existing && (existing.status === "succeeded" || existing.status === "warning")) {
     // The step ran again after its work was done but before Upstash stored the result.
-    end = { id: nodeId, status: existing.status as NodeStatus };
-    nodeOutput = existing.output;
-  } else if (existing?.status === "failed") {
-    failure = existing.error ?? { code: "NODE_FAILED", message: "The node run failed." };
-  } else if (!run.test?.nodeId && run.test && run.pins?.[nodeId] !== undefined) {
+    return { kind: "end", end: { id: nodeId, status: existing.status as NodeStatus }, nodeOutput: existing.output };
+  }
+  if (existing?.status === "failed") return { kind: "failure", failure: existing.error ?? { code: "NODE_FAILED", message: "The node run failed." } };
+  if (!run.test?.nodeId && run.test && run.pins?.[nodeId] !== undefined) {
     // A test of the whole draft does not call a pinned node: the pinned output stands in for it.
     const pinned = run.pins[nodeId]?.output ?? null;
-    const { scope } = buildScope(run, runId, nodeRuns);
+    const { scope: exprScope } = buildScope(run, runId, nodeRuns);
     let input: Record<string, unknown> | null = null;
     try {
-      input = resolveInputs(node.data.inputs, scope);
+      input = resolveInputs(node.data.inputs, exprScope);
     } catch {
       input = null;
     }
@@ -388,136 +518,339 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
           on conflict (run_id, node_id) do update set status = 'succeeded', output = excluded.output, finished_at = now()`,
       sql`insert into run_logs (id, run_id, level, message) values (${uuidv7()}, ${runId}, 'info', ${`Node "${label}" is pinned: its pinned output was used, the node was not called.`})`,
     ]);
-    end = { id: nodeId, status: "succeeded" };
-    nodeOutput = pinned;
+    return { kind: "end", end: { id: nodeId, status: "succeeded" }, nodeOutput: pinned };
+  }
+  const version = await loadVersion(sql, node);
+  if (!version) {
+    const failure = { code: "NODE_VERSION_NOT_FOUND", message: `Node "${nodeId}" uses ${node.data.nodeKey}@${node.data.version}, which is not registered.` };
+    await sql.transaction([...skipRows, ...writeNodeRuns(sql, runId, [{ id: nodeId, type: "action", label, status: "failed" }])]);
+    await failRunAt(sql, runId, null, failure);
+    return { kind: "ended", result: { ends: [{ id: nodeId, status: "failed" }], finished: true, failed: failure } };
+  }
+  const { scope: exprScope } = buildScope(run, runId, nodeRuns);
+  try {
+    return { kind: "call", version, input: resolveInputs(node.data.inputs, exprScope) };
+  } catch (error) {
+    if (!(error instanceof ExpressionError)) throw error;
+    const failure = { code: "EXPRESSION_ERROR", message: `Node "${nodeId}": ${error.message}` };
+    await sql.transaction([...skipRows, ...writeNodeRuns(sql, runId, [{ id: nodeId, type: "action", label, status: "failed" }])]);
+    return { kind: "ended", result: await finishAfterFailure(sql, runId, node, failure) };
+  }
+}
+
+/** Ends the step for a `Prepared` that needs no call. */
+async function endPrepared(sql: Sql, scope: ActionScope, prepared: Exclude<Prepared, { kind: "call" }>, options: ActionOptions): Promise<StepResult> {
+  if (prepared.kind === "ended") return prepared.result;
+  if (prepared.kind === "failure") return finishAfterFailure(sql, scope.runId, scope.node, prepared.failure);
+  return afterNodeEnd(sql, scope, prepared.end, prepared.nodeOutput, options);
+}
+
+function headersFor(runId: string, nodeRunId: string, attempt: number): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "X-XaaS-Run-Id": runId,
+    "X-XaaS-Node-Run-Id": nodeRunId,
+    "X-XaaS-Attempt": String(attempt),
+    // The same for every attempt, so the node can skip work it already did.
+    "Idempotency-Key": nodeRunId,
+  };
+}
+
+function envelopeFor(scope: ActionScope, version: VersionRow, input: Record<string, unknown>): Record<string, unknown> {
+  const { run, runId, label } = scope;
+  return {
+    input,
+    // Secrets, variables and connections never travel here: the node reads what is mapped to it through the resource broker.
+    context: {},
+    run: { id: runId, no: run.no, workspace: run.workspace_id, workflow: run.workflow_slug, version: run.workflow_version, env: run.env },
+    node: { key: version.key, version: version.version, label },
+  };
+}
+
+/**
+ * Runs one sync action node; the body of the `node:<id>` step. A failed attempt that may be tried again
+ * throws, so Upstash retries the step. A final failure ends the run and is returned, not thrown.
+ */
+export async function executeAction(sql: Sql, runId: string, nodeId: string, callNode: CallNode, options: ActionOptions): Promise<StepResult> {
+  const begun = await beginAction(sql, runId, nodeId, options.skips);
+  if ("ended" in begun) return begun.ended;
+  const { scope } = begun;
+  const { node, label } = scope;
+
+  const prepared = await prepareCall(sql, scope);
+  if (prepared.kind !== "call") return endPrepared(sql, scope, prepared, options);
+  const { version, input } = prepared;
+
+  const maxAttempts = clampToRange(node.data.settings.maxAttempts ?? version.retry_max_attempts, MAX_ATTEMPTS);
+  const timeoutMs = clampToRange(node.data.settings.timeout ?? version.timeout_ms, TIMEOUT_MS);
+  // The run token of this attempt: the node shows it to xaas-resource-broker. Only its hash is stored (with the attempt).
+  const resourceToken = await newResourceToken();
+  const [nodeRun] = await sql`
+    with nr as (
+      insert into node_runs (id, run_id, node_id, node_type, label, node_version_id, attempt_count, input)
+      values (${uuidv7()}, ${runId}, ${nodeId}, 'action', ${label}, ${version.id}, 1, ${json(input)}::jsonb)
+      on conflict (run_id, node_id) do update set attempt_count = node_runs.attempt_count + 1
+      returning id, attempt_count
+    ), at as (
+      insert into attempts (id, node_run_id, attempt, resource_token_hash, resource_token_expires_at)
+      select ${uuidv7()}::uuid, nr.id, nr.attempt_count, ${resourceToken.hash}, now() + ${timeoutMs + RESOURCE_TOKEN_GRACE_MS} * interval '1 millisecond'
+      from nr where nr.attempt_count <= ${maxAttempts}::int
+      on conflict (node_run_id, attempt) do nothing
+    )
+    select id, attempt_count from nr`;
+  const nodeRunId: string = nodeRun.id;
+  const attempt: number = nodeRun.attempt_count;
+
+  if (attempt > maxAttempts) {
+    const failure = { code: "ATTEMPTS_EXHAUSTED", message: `The node failed ${maxAttempts} time(s).` };
+    await sql`update node_runs set status = 'failed', error = ${json(failure)}::jsonb, attempt_count = ${maxAttempts}, finished_at = now() where id = ${nodeRunId}`;
+    return finishAfterFailure(sql, runId, node, failure);
+  }
+
+  const headers = headersFor(runId, nodeRunId, attempt);
+  // Sent to the node, never stored: `headers` (what `attempts.request` keeps) leaves it out.
+  const sentHeaders = { ...headers, "X-XAAS-Resource-Token": resourceToken.token };
+  const envelope = envelopeFor(scope, version, input);
+  const outcome = await callNode({ scriptName: version.script_name, transport: version.transport, timeoutMs, headers: sentHeaders, body: JSON.stringify(envelope) });
+  const verdict = judgeNodeOutcome(outcome);
+  const stored = { request: json({ headers, body: envelope }), response: json(capped(outcome.kind === "response" ? { status: outcome.status, body: outcome.body } : { kind: outcome.kind })) };
+
+  const settled = await settleAttempt(sql, scope, nodeRunId, attempt, maxAttempts, verdict, stored);
+  if (settled.kind === "retry") throw new NodeAttemptError(verdict.ok ? "retry" : `${verdict.error.code}: ${verdict.error.message}`);
+  if (settled.kind === "ended") return settled.result;
+  return afterNodeEnd(sql, scope, settled.end, settled.nodeOutput, options);
+}
+
+// ---------------------------------------------------------------------------
+// Async action nodes (callback or polling)
+// ---------------------------------------------------------------------------
+
+/** What the steps of an async node need besides the database: the secrets of callbacks and run tokens. */
+export type AsyncEnv = { ingressUrl: string; callbackSigningKey: string; resourceTokenSecret: string };
+
+/** Result of a step of an async node, read by the function body (orchestrate). */
+export type AsyncStep =
+  | { kind: "ended"; result: StepResult }
+  /** The node took the job (202); wait for its callback or poll it. */
+  | { kind: "accepted"; nodeRunId: string }
+  /** The attempt failed and another may follow, after `delayMs`. */
+  | { kind: "retry"; delayMs: number }
+  /** Polling: the job still runs. `errors`: failed status calls in a row so far. */
+  | { kind: "running"; errors: number; retryAfterMs?: number };
+
+type AttemptRow = {
+  id: string;
+  node_run_id: string;
+  accepted_at: Date | null;
+  job_id: string | null;
+  status_url: string | null;
+  callback_at: Date | null;
+  callback: { body: unknown; headers: Record<string, string> } | null;
+  finished_at: Date | null;
+  status: string;
+};
+
+async function readAttempt(sql: Sql, runId: string, nodeId: string, attempt: number): Promise<AttemptRow | null> {
+  const [row] = await sql`
+    select a.id, a.node_run_id, a.accepted_at, a.job_id, a.status_url, a.callback_at, a.callback, a.finished_at, a.status
+    from attempts a join node_runs nr on nr.id = a.node_run_id
+    where nr.run_id = ${runId} and nr.node_id = ${nodeId} and a.attempt = ${attempt}`;
+  return (row as unknown as AttemptRow) ?? null;
+}
+
+/** Turns a settled attempt into the answer of an async step. */
+async function asyncAnswer(sql: Sql, scope: ActionScope, settled: Settled, plan: AsyncPlan, attempt: number, options: ActionOptions): Promise<AsyncStep> {
+  if (settled.kind === "retry") return { kind: "retry", delayMs: retryDelayMs(plan.backoff, plan.baseDelayMs, attempt) };
+  if (settled.kind === "ended") return { kind: "ended", result: settled.result };
+  return { kind: "ended", result: await afterNodeEnd(sql, scope, settled.end, settled.nodeOutput, options) };
+}
+
+/** An async step that ran again after its attempt was recorded: answer from what the database holds. */
+async function replayedAttempt(sql: Sql, scope: ActionScope, row: AttemptRow, plan: AsyncPlan, attempt: number, options: ActionOptions): Promise<AsyncStep | null> {
+  if (!row.finished_at) return null;
+  const prepared = await prepareCall(sql, scope);
+  if (prepared.kind !== "call") return { kind: "ended", result: await endPrepared(sql, scope, prepared, options) };
+  // The attempt failed and the node run goes on: the next attempt follows.
+  return { kind: "retry", delayMs: retryDelayMs(plan.backoff, plan.baseDelayMs, attempt) };
+}
+
+/** Calls the node again within an attempt (`POST /callback`, the status route), with the attempt's own token. */
+async function callAgain(callNode: CallNode, env: AsyncEnv, scope: ActionScope, version: VersionRow, row: AttemptRow, attempt: number, plan: AsyncPlan, path: string, method: "GET" | "POST", body?: unknown) {
+  const token = await derivedResourceToken(env.resourceTokenSecret, row.id);
+  const headers = { ...headersFor(scope.runId, row.node_run_id, attempt), "X-XAAS-Resource-Token": token.token };
+  return callNode({ scriptName: version.script_name, transport: version.transport, timeoutMs: plan.timeoutMs, headers, body: body === undefined ? undefined : JSON.stringify(body), path, method });
+}
+
+/**
+ * First step of attempt `attempt` of an async node (`node:<id>:<attempt>`): sends the job. The node answers 202 (wait for
+ * its callback, or poll it), its output right away (as a sync node would), or an error.
+ */
+export async function startAsyncAttempt(sql: Sql, env: AsyncEnv, runId: string, nodeId: string, attempt: number, plan: AsyncPlan, callNode: CallNode, options: ActionOptions): Promise<AsyncStep> {
+  const begun = await beginAction(sql, runId, nodeId, options.skips);
+  if ("ended" in begun) return { kind: "ended", result: begun.ended };
+  const { scope } = begun;
+  const prepared = await prepareCall(sql, scope);
+  if (prepared.kind !== "call") return { kind: "ended", result: await endPrepared(sql, scope, prepared, options) };
+  const { version, input } = prepared;
+
+  // The token is derived from the attempt id, so a step that runs again makes the same one.
+  const newId = uuidv7();
+  const newToken = await derivedResourceToken(env.resourceTokenSecret, newId);
+  const tokenMs = plan.maxWaitMs + plan.timeoutMs + RESOURCE_TOKEN_GRACE_MS;
+  await sql`
+    with nr as (
+      insert into node_runs (id, run_id, node_id, node_type, label, node_version_id, attempt_count, input)
+      values (${uuidv7()}, ${runId}, ${nodeId}, 'action', ${scope.label}, ${version.id}, ${attempt}, ${json(input)}::jsonb)
+      on conflict (run_id, node_id) do update set attempt_count = greatest(node_runs.attempt_count, excluded.attempt_count)
+      returning id
+    )
+    insert into attempts (id, node_run_id, attempt, resource_token_hash, resource_token_expires_at)
+    select ${newId}::uuid, nr.id, ${attempt}, ${newToken.hash}, now() + ${tokenMs} * interval '1 millisecond' from nr
+    on conflict (node_run_id, attempt) do nothing`;
+  const row = await readAttempt(sql, runId, nodeId, attempt);
+  if (!row) throw new Error("The attempt was just written.");
+  if (row.accepted_at) return { kind: "accepted", nodeRunId: row.node_run_id };
+  const replayed = await replayedAttempt(sql, scope, row, plan, attempt, options);
+  if (replayed) return replayed;
+
+  const token = row.id === newId ? newToken : await derivedResourceToken(env.resourceTokenSecret, row.id);
+  const headers = headersFor(runId, row.node_run_id, attempt);
+  const body = envelopeFor(scope, version, input);
+  if (plan.completion === "callback") {
+    const exp = Math.floor((Date.now() + plan.maxWaitMs) / 1000) + CALLBACK_URL_GRACE_S;
+    body.callback_url = await callbackUrl(env.ingressUrl, env.callbackSigningKey, row.node_run_id, attempt, exp);
+  }
+  const outcome = await callNode({
+    scriptName: version.script_name,
+    transport: version.transport,
+    timeoutMs: plan.timeoutMs,
+    headers: { ...headers, "X-XAAS-Resource-Token": token.token },
+    body: JSON.stringify(body),
+  });
+  // What the attempt keeps: the callback URL works as a credential, so only its path.
+  const keptBody = typeof body.callback_url === "string" ? { ...body, callback_url: body.callback_url.split("?")[0] } : body;
+  const stored = { request: json({ headers, body: keptBody }), response: json(capped(outcome.kind === "response" ? { status: outcome.status, body: outcome.body } : { kind: outcome.kind })) };
+
+  if (outcome.kind === "response" && outcome.status === 202) {
+    const accepted = isRecord(outcome.body) ? outcome.body : {};
+    const jobId = typeof accepted.job_id === "string" ? accepted.job_id.slice(0, 500) : null;
+    const statusUrl = typeof accepted.status_url === "string" ? accepted.status_url : null;
+    if (plan.completion === "polling" && !isNodePath(statusUrl)) {
+      const verdict: NodeVerdict = {
+        ok: false,
+        retryable: false,
+        httpStatus: 202,
+        error: { code: "INVALID_ACCEPT", message: 'A polling node must answer 202 with a "status_url" path of its own (starting with "/").' },
+      };
+      return asyncAnswer(sql, scope, await settleAttempt(sql, scope, row.node_run_id, attempt, plan.maxAttempts, verdict, stored), plan, attempt, options);
+    }
+    const waiting = plan.completion === "callback" ? "waiting for its callback" : "polling it";
+    await sql.transaction([
+      ...scope.skipRows,
+      sql`update attempts set http_status = 202, request = ${stored.request}::jsonb, response = ${stored.response}::jsonb, accepted_at = now(), job_id = ${jobId}, status_url = ${statusUrl}
+          where id = ${row.id}`,
+      sql`insert into run_logs (id, run_id, node_run_id, level, message) values (${uuidv7()}, ${runId}, ${row.node_run_id}, 'info', ${`Attempt ${attempt} accepted (202), ${waiting}`})`,
+    ]);
+    return { kind: "accepted", nodeRunId: row.node_run_id };
+  }
+  const settled = await settleAttempt(sql, scope, row.node_run_id, attempt, plan.maxAttempts, judgeNodeOutcome(outcome), stored);
+  return asyncAnswer(sql, scope, settled, plan, attempt, options);
+}
+
+/**
+ * After the wait for a callback (`done:<id>:<attempt>`): reads what the ingress recorded (through the node's
+ * `POST /callback` when it reads its own callbacks), or the timeout, and ends the attempt.
+ */
+export async function completeAsyncAttempt(
+  sql: Sql,
+  env: AsyncEnv,
+  runId: string,
+  nodeId: string,
+  attempt: number,
+  plan: AsyncPlan,
+  callNode: CallNode,
+  timedOut: boolean,
+  options: ActionOptions,
+): Promise<AsyncStep> {
+  const begun = await beginAction(sql, runId, nodeId, []);
+  if ("ended" in begun) return { kind: "ended", result: begun.ended };
+  const { scope } = begun;
+  const row = await readAttempt(sql, runId, nodeId, attempt);
+  if (!row) throw new Error(`Attempt ${attempt} of "${nodeId}" is missing.`);
+  const replayed = await replayedAttempt(sql, scope, row, plan, attempt, options);
+  if (replayed) return replayed;
+
+  let verdict: NodeVerdict;
+  if (!row.callback_at || !row.callback) {
+    verdict = timedOut
+      ? { ok: false, retryable: true, httpStatus: null, error: { code: "TIMEOUT", message: `No callback came within ${Math.round(plan.maxWaitMs / 1000)} s.` } }
+      : { ok: false, retryable: true, httpStatus: null, error: { code: "CALLBACK_MISSING", message: "The run was woken without a recorded callback." } };
+  } else if (plan.callbackHandler) {
+    const version = await loadVersion(sql, scope.node);
+    if (!version) throw new Error("The node version was there when the attempt started.");
+    const [nodeRun] = await sql`select input from node_runs where id = ${row.node_run_id}`;
+    const outcome = await callAgain(callNode, env, scope, version, row, attempt, plan, "/callback", "POST", {
+      job_id: row.job_id,
+      payload: row.callback.body,
+      headers: row.callback.headers,
+      input: nodeRun?.input ?? {},
+    });
+    verdict = judgeNodeOutcome(outcome);
   } else {
-    const version = await loadVersion(sql, node);
-    if (!version) {
-      failure = { code: "NODE_VERSION_NOT_FOUND", message: `Node "${nodeId}" uses ${node.data.nodeKey}@${node.data.version}, which is not registered.` };
-      await sql.transaction([...skipRows, ...writeNodeRuns(sql, runId, [{ id: nodeId, type: "action", label, status: "failed" }])]);
-      await failRunAt(sql, runId, null, failure);
-      return { ends: [{ id: nodeId, status: "failed" }], finished: true, failed: failure };
-    }
-
-    const { scope } = buildScope(run, runId, nodeRuns);
-    let input: Record<string, unknown>;
-    try {
-      input = resolveInputs(node.data.inputs, scope);
-    } catch (error) {
-      if (!(error instanceof ExpressionError)) throw error;
-      failure = { code: "EXPRESSION_ERROR", message: `Node "${nodeId}": ${error.message}` };
-      await sql.transaction([...skipRows, ...writeNodeRuns(sql, runId, [{ id: nodeId, type: "action", label, status: "failed" }])]);
-      return finishAfterFailure(sql, runId, node, failure);
-    }
-
-    const maxAttempts = node.data.settings.maxAttempts ?? version.retry_max_attempts;
-    const timeoutMs = node.data.settings.timeout ?? version.timeout_ms;
-    // The run token of this attempt: the node shows it to xaas-resource-broker. Only its hash is stored (with the attempt).
-    const resourceToken = await newResourceToken();
-    const [nodeRun] = await sql`
-      with nr as (
-        insert into node_runs (id, run_id, node_id, node_type, label, node_version_id, attempt_count, input)
-        values (${uuidv7()}, ${runId}, ${nodeId}, 'action', ${label}, ${version.id}, 1, ${json(input)}::jsonb)
-        on conflict (run_id, node_id) do update set attempt_count = node_runs.attempt_count + 1
-        returning id, attempt_count
-      ), at as (
-        insert into attempts (id, node_run_id, attempt, resource_token_hash, resource_token_expires_at)
-        select ${uuidv7()}::uuid, nr.id, nr.attempt_count, ${resourceToken.hash}, now() + ${timeoutMs + RESOURCE_TOKEN_GRACE_MS} * interval '1 millisecond'
-        from nr where nr.attempt_count <= ${maxAttempts}::int
-        on conflict (node_run_id, attempt) do nothing
-      )
-      select id, attempt_count from nr`;
-    const nodeRunId: string = nodeRun.id;
-    const attempt: number = nodeRun.attempt_count;
-
-    if (attempt > maxAttempts) {
-      failure = { code: "ATTEMPTS_EXHAUSTED", message: `The node failed ${maxAttempts} time(s).` };
-      await sql`update node_runs set status = 'failed', error = ${json(failure)}::jsonb, attempt_count = ${maxAttempts}, finished_at = now() where id = ${nodeRunId}`;
-      return finishAfterFailure(sql, runId, node, failure);
-    }
-
-    const headers = {
-      "Content-Type": "application/json",
-      "X-XaaS-Run-Id": runId,
-      "X-XaaS-Node-Run-Id": nodeRunId,
-      "X-XaaS-Attempt": String(attempt),
-      // The same for every attempt, so the node can skip work it already did.
-      "Idempotency-Key": nodeRunId,
-    };
-    // Sent to the node, never stored: `headers` (what `attempts.request` keeps) leaves it out.
-    const sentHeaders = { ...headers, "X-XAAS-Resource-Token": resourceToken.token };
-    const envelope = {
-      input,
-      // Secrets, variables and connections never travel here: the node reads what is mapped to it through the resource broker.
-      context: {},
-      run: { id: runId, no: run.no, workspace: run.workspace_id, workflow: run.workflow_slug, version: run.workflow_version, env: run.env },
-      node: { key: version.key, version: version.version, label },
-    };
-    const outcome = await callNode({ scriptName: version.script_name, transport: version.transport, timeoutMs, headers: sentHeaders, body: JSON.stringify(envelope) });
-    const verdict = judgeNodeOutcome(outcome);
-    const stored = { request: json({ headers, body: envelope }), response: json(capped(outcome.kind === "response" ? { status: outcome.status, body: outcome.body } : { kind: outcome.kind })) };
-
-    if (verdict.ok) {
-      const status: NodeStatus = attempt > 1 ? "warning" : "succeeded";
-      await sql.transaction([
-        ...skipRows,
-        sql`update attempts set status = 'succeeded', http_status = ${verdict.httpStatus}, request = ${stored.request}::jsonb, response = ${stored.response}::jsonb, finished_at = now()
-            where node_run_id = ${nodeRunId} and attempt = ${attempt}`,
-        sql`update node_runs set status = ${status}, output = ${json(verdict.output)}::jsonb, finished_at = now() where id = ${nodeRunId}`,
-        sql`insert into run_logs (id, run_id, node_run_id, level, message) values (${uuidv7()}, ${runId}, ${nodeRunId}, 'info', ${attempt > 1 ? `Succeeded on attempt ${attempt}` : "Succeeded"})`,
-      ]);
-      end = { id: nodeId, status };
-      nodeOutput = verdict.output;
-    } else {
-      const error = json(verdict.error);
-      const attemptRow = sql`
-        update attempts set status = 'failed', http_status = ${verdict.httpStatus}, error = ${error}::jsonb, request = ${stored.request}::jsonb, response = ${stored.response}::jsonb, finished_at = now()
-        where node_run_id = ${nodeRunId} and attempt = ${attempt}`;
-      const log = sql`insert into run_logs (id, run_id, node_run_id, level, message) values (${uuidv7()}, ${runId}, ${nodeRunId}, 'warn', ${`Attempt ${attempt} failed: ${verdict.error.message}`})`;
-      if (verdict.retryable && attempt < maxAttempts) {
-        await sql.transaction([attemptRow, log]);
-        throw new NodeAttemptError(`${verdict.error.code}: ${verdict.error.message}`);
-      }
-      failure = verdict.error;
-      if (node.data.settings.onError === "continue") {
-        // The run goes on with this node's output as null.
-        await sql.transaction([
-          ...skipRows,
-          attemptRow,
-          log,
-          sql`update node_runs set status = 'warning', error = ${error}::jsonb, output = 'null'::jsonb, finished_at = now() where id = ${nodeRunId}`,
-        ]);
-        end = { id: nodeId, status: "warning" };
-        nodeOutput = null;
-        failure = null;
-      } else {
-        await sql.transaction([...skipRows, attemptRow, log]);
-        return finishAfterFailure(sql, runId, node, verdict.error, nodeRunId);
-      }
-    }
+    verdict = judgeCallbackBody(row.callback.body);
   }
+  const settled = await settleAttempt(sql, scope, row.node_run_id, attempt, plan.maxAttempts, verdict, {});
+  return asyncAnswer(sql, scope, settled, plan, attempt, options);
+}
 
-  if (failure && !end) return finishAfterFailure(sql, runId, node, failure);
-  if (!end) throw new Error("Unreachable: a node run without an end.");
+/** One poll of a polling node (`check:<id>:<attempt>:<poll>`): asks its status route and ends the attempt once the job is done. */
+export async function pollAsyncAttempt(
+  sql: Sql,
+  env: AsyncEnv,
+  runId: string,
+  nodeId: string,
+  attempt: number,
+  poll: number,
+  errors: number,
+  plan: AsyncPlan,
+  callNode: CallNode,
+  options: ActionOptions,
+): Promise<AsyncStep> {
+  const begun = await beginAction(sql, runId, nodeId, []);
+  if ("ended" in begun) return { kind: "ended", result: begun.ended };
+  const { scope } = begun;
+  const row = await readAttempt(sql, runId, nodeId, attempt);
+  if (!row || !row.status_url || !row.accepted_at) throw new Error(`Attempt ${attempt} of "${nodeId}" was not accepted for polling.`);
+  const replayed = await replayedAttempt(sql, scope, row, plan, attempt, options);
+  if (replayed) return replayed;
+  const maxPolls = plan.poll?.maxPolls ?? 1;
+  const settle = async (verdict: NodeVerdict) =>
+    asyncAnswer(sql, scope, await settleAttempt(sql, scope, row.node_run_id, attempt, plan.maxAttempts, verdict, {}), plan, attempt, options);
+  const timeout = (message: string): NodeVerdict => ({ ok: false, retryable: true, httpStatus: null, error: { code: "TIMEOUT", message } });
 
-  // Succeeded. Alone in its wave, the step also decides what follows and may end the run.
-  const ends: NodeEnd[] = [end];
-  if (!options.solo) return { ends, finished: false };
+  if (new Date(row.accepted_at).getTime() + plan.maxWaitMs <= Date.now()) return settle(timeout(`The job did not end within ${Math.round(plan.maxWaitMs / 1000)} s.`));
 
-  const state = fromWire(options.wire);
-  state.status.set(nodeId, end.status);
-  const { scope, outputs } = buildScope(run, runId, nodeRuns, { [nodeId]: nodeOutput });
-  const decided = decideBuiltIns(graph, state, scope, outputs);
-  ends.push(...decided.ends);
-  const rows = [...rowsForSkipped(graph, decided.skipped), ...decided.writes];
-  const queries = writeNodeRuns(sql, runId, rows);
-  if (queries.length) await sql.transaction(queries);
-
-  if (decided.readyActions.length === 0) {
-    await finishRun(sql, runId, "succeeded");
-    return { ends, finished: true };
+  const version = await loadVersion(sql, scope.node);
+  if (!version) throw new Error("The node version was there when the attempt started.");
+  const outcome = await callAgain(callNode, env, scope, version, row, attempt, plan, row.status_url, "GET");
+  await sql`update attempts set poll_count = poll_count + 1, last_polled_at = now() where id = ${row.id}`;
+  const judged = judgePollOutcome(outcome);
+  if (judged.kind === "ended") return settle(judged.verdict);
+  if (judged.kind === "unreachable" && errors + 1 >= POLL_ERRORS_IN_A_ROW) {
+    return settle({ ok: false, retryable: true, httpStatus: null, error: { code: "POLL_FAILED", message: `The status route failed ${errors + 1} times in a row: ${judged.error.message}` } });
   }
-  return { ends, finished: false };
+  if (poll >= maxPolls) return settle(timeout(`The job did not end within ${maxPolls} polls.`));
+  if (judged.kind === "unreachable") return { kind: "running", errors: errors + 1 };
+  return { kind: "running", errors: 0, ...(judged.retryAfterMs !== undefined ? { retryAfterMs: judged.retryAfterMs } : {}) };
+}
+
+/** A path of the node itself, never a URL elsewhere: the runner only calls it through the node's binding. */
+function isNodePath(value: string | null): value is string {
+  return typeof value === "string" && value.length <= 500 && value.startsWith("/") && !value.startsWith("//") && !/[\s\\]/.test(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /** A node failed for good: the run fails with it. */

@@ -10,3 +10,6 @@ QSTASH_NEXT_SIGNING_KEY=
 # UPSTASH_WORKFLOW_URL=https://dev.example.com
 # Bearer token of GET /nodes/<worker name>/health; the deploy script sends it (RUNNER_ADMIN_TOKEN in the app).
 RUNNER_ADMIN_TOKEN=
+# Async nodes: signs callback URLs (same value as the ingress), and derives the run tokens of async attempts.
+CALLBACK_SIGNING_KEY=
+RESOURCE_TOKEN_SECRET=
