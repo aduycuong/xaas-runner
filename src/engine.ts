@@ -828,14 +828,15 @@ export async function pollAsyncAttempt(
     asyncAnswer(sql, scope, await settleAttempt(sql, scope, row.node_run_id, attempt, plan.maxAttempts, verdict, {}), plan, attempt, options);
   const timeout = (message: string): NodeVerdict => ({ ok: false, retryable: true, httpStatus: null, error: { code: "TIMEOUT", message } });
 
-  if (new Date(row.accepted_at).getTime() + plan.maxWaitMs <= Date.now()) return settle(timeout(`The job did not end within ${Math.round(plan.maxWaitMs / 1000)} s.`));
-
   const version = await loadVersion(sql, scope.node);
   if (!version) throw new Error("The node version was there when the attempt started.");
   const outcome = await callAgain(callNode, env, scope, version, row, attempt, plan, row.status_url, "GET");
   await sql`update attempts set poll_count = poll_count + 1, last_polled_at = now() where id = ${row.id}`;
   const judged = judgePollOutcome(outcome);
+  // The node is asked even after its max wait: the branches of a wave move together, so a poll can come late
+  // because a sibling was waiting; a job that ended in time still counts. Only a job still running is a TIMEOUT.
   if (judged.kind === "ended") return settle(judged.verdict);
+  if (new Date(row.accepted_at).getTime() + plan.maxWaitMs <= Date.now()) return settle(timeout(`The job did not end within ${Math.round(plan.maxWaitMs / 1000)} s.`));
   if (judged.kind === "unreachable" && errors + 1 >= POLL_ERRORS_IN_A_ROW) {
     return settle({ ok: false, retryable: true, httpStatus: null, error: { code: "POLL_FAILED", message: `The status route failed ${errors + 1} times in a row: ${judged.error.message}` } });
   }
