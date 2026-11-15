@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev -c wrangler.jsonc -c ../node-core-delay/wrangler.jsonc -c ../node-core-echo/wrangler.jsonc -c ../node-core-poll-delay/wrangler.jsonc --port 3000",
+    "dev": "wrangler dev -c wrangler.jsonc -c ../node-ai-llm/wrangler.jsonc -c ../node-core-delay/wrangler.jsonc -c ../node-core-echo/wrangler.jsonc -c ../node-core-poll-delay/wrangler.jsonc -c ../node-data-transform/wrangler.jsonc -c ../node-http-request/wrangler.jsonc -c ../node-notify-email/wrangler.jsonc --port 3000",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test \"src/**/*.test.ts\""
