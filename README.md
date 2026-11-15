@@ -1,10 +1,10 @@
 # xaas-runner
 
-Worker chạy các run của XaaS Workflows. Upstash Workflow gọi `POST /run/v3` một lần cho mỗi step; runner đọc workflow từ database, gọi node qua service binding và ghi kết quả. Kiến trúc: `xaas-workflows/docs/kien-truc-upstash-cloudflare-hono.md`.
+Worker chạy các run của XaaS Workflows. Upstash Workflow gọi `POST /run/v4` một lần cho mỗi step; runner đọc workflow từ database, gọi node qua service binding và ghi kết quả. Kiến trúc: `xaas-workflows/docs/kien-truc-upstash-cloudflare-hono.md`.
 
 | Route | Ai gọi | Xác thực |
 | --- | --- | --- |
-| `POST /run/v3` | Upstash Workflow | Chữ ký Upstash (signing keys) |
+| `POST /run/v4` | Upstash Workflow | Chữ ký Upstash (signing keys) |
 | `GET /nodes/<tên Worker>/health` | Script deploy node | Bearer `RUNNER_ADMIN_TOKEN` |
 | `GET /health` | Uptime monitor | Không |
 
@@ -63,6 +63,8 @@ npx wrangler secret put RUNNER_ADMIN_TOKEN
 | `DATABASE_URL` | Connection string của PlanetScale Postgres, cùng database với app; giữ `?sslmode=verify-full`, bỏ `sslrootcert` |
 | `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | Upstash console, mục QStash |
 | `RUNNER_ADMIN_TOKEN` | Tự sinh một chuỗi ngẫu nhiên dài; đặt cùng giá trị vào `.env` của app |
+| `CALLBACK_SIGNING_KEY` | Tự sinh một chuỗi ngẫu nhiên dài; **cùng giá trị** với ingress (runner ký `callback_url` của node Async, ingress kiểm) |
+| `RESOURCE_TOKEN_SECRET` | Tự sinh một chuỗi ngẫu nhiên dài, chỉ runner dùng: suy ra token run của attempt Async (mỗi lần runner gọi lại node trong cùng attempt) |
 | `QSTASH_URL` (tùy chọn) | Chỉ khi QStash của bạn không ở endpoint mặc định (theo vùng); đặt bằng `wrangler secret put` như trên |
 
 Không đặt `UPSTASH_WORKFLOW_URL` trên Cloudflare: biến đó chỉ dùng ở local khi chạy qua tunnel.
@@ -119,7 +121,7 @@ npm run deploy
 Tên và thứ tự các step (`load`, `node:<id>`, `finish`) là giao kèo với những run đang chạy dở: một run đang chờ retry sẽ chạy tiếp bằng code mới nhưng dùng kết quả step cũ.
 
 - Được phép deploy thẳng: sửa logic bên trong một step, thêm route, thêm binding.
-- Đổi tên, bỏ hoặc đổi thứ tự step: thêm route mới (`/run/v4`), giữ `/run/v3` cho tới khi các run cũ chạy hết, và đổi `RUNNER_ROUTE` trong ingress.
+- Đổi tên, bỏ hoặc đổi thứ tự step: thêm route mới (`/run/v5`), giữ `/run/v4` cho tới khi các run cũ chạy hết, và đổi `RUNNER_ROUTE` trong ingress.
 
 ### Quay lại bản trước và xem log
 
