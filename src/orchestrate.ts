@@ -77,7 +77,7 @@ export async function orchestrate(plan: Extract<RunPlan, { ok: true }> | { ok: f
 
   const graph: Graph = plan.graph;
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
-  const state = startState(graph, plan.triggerId);
+  const state = startState(graph);
   let pendingSkips: string[] = [];
   let flows = 0;
   let finished = false;

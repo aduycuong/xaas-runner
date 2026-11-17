@@ -72,7 +72,8 @@ const triggerNode = z.object({
   id: nodeIdSchema,
   type: z.literal("trigger"),
   position: positionSchema,
-  data: z.object({ label: z.string().optional(), triggerId: z.uuid().optional() }).default({}),
+  /** A workflow has one trigger node; its triggers live on the Triggers page. Older graphs may still carry `triggerId`: it is dropped. */
+  data: z.object({ label: z.string().optional() }).default({}),
 });
 
 const actionNode = z.object({
@@ -529,13 +530,10 @@ export function planNext(graph: Graph, state: RunState): Plan {
   return { ready, skipped };
 }
 
-/** Which trigger nodes start a run: the ones tied to the trigger that fired, or all when none is. */
-export function startState(graph: Graph, firedTriggerId: string | null): RunState {
+/** The state a run starts from: the trigger node has fired, whatever started the run (older graphs with several: all of them). */
+export function startState(graph: Graph): RunState {
   const state = emptyState();
-  const triggers = graph.nodes.filter((node) => node.type === "trigger");
-  const matching = triggers.filter((node) => firedTriggerId !== null && node.data.triggerId === firedTriggerId);
-  const active = matching.length ? matching : triggers;
-  for (const node of triggers) state.status.set(node.id, active.includes(node) ? "succeeded" : "skipped");
+  for (const node of graph.nodes) if (node.type === "trigger") state.status.set(node.id, "succeeded");
   return state;
 }
 

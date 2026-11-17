@@ -159,11 +159,11 @@ test("evaluateSwitch: first match, default, or nothing", () => {
 });
 
 /** Runs a graph with a fake executor: every action succeeds unless listed in `fail`. Returns statuses in order. */
-function simulate(raw: unknown, trig: unknown, options: { fail?: string[]; firedTriggerId?: string | null } = {}) {
+function simulate(raw: unknown, trig: unknown, options: { fail?: string[] } = {}) {
   const { graph, issues } = validateGraph(raw);
   assert.deepEqual(issues, []);
   const g = graph as Graph;
-  const state = startState(g, options.firedTriggerId ?? null);
+  const state = startState(g);
   const outputs: Record<string, unknown> = {};
   const ran: string[] = [];
   const waves: string[][] = [];
@@ -236,22 +236,22 @@ test("run: a switch with no match and no default skips everything below it", () 
   assert.deepEqual(r.status, { t: "succeeded", s: "succeeded", a: "skipped", after: "skipped" });
 });
 
-test("run: a failed node stops scheduling, and a trigger that did not fire is skipped", () => {
+test("run: a failed node stops scheduling; every trigger node starts the run", () => {
   const r = simulate(branching(), { name: "An", vip: true }, { fail: ["a"] });
   assert.equal(r.status.a, "failed");
   assert.equal(r.status.done, undefined);
 
   const g = {
-    nodes: [{ id: "t1", type: "trigger", data: { triggerId: "11111111-1111-4111-8111-111111111111" } }, { id: "t2", type: "trigger", data: { triggerId: "22222222-2222-4222-8222-222222222222" } }, action("a"), action("b")],
+    // An older graph with two trigger nodes (one still carrying the dropped `triggerId`): both start.
+    nodes: [{ id: "t1", type: "trigger", data: { triggerId: "11111111-1111-4111-8111-111111111111" } }, { id: "t2", type: "trigger", data: {} }, action("a"), action("b")],
     edges: [edge("t1", "a"), edge("t2", "b")],
   };
-  assert.deepEqual(simulate(g, {}, { firedTriggerId: "22222222-2222-4222-8222-222222222222" }).status, { t1: "skipped", t2: "succeeded", a: "skipped", b: "succeeded" });
-  assert.equal(simulate(g, {}).status.a, "succeeded");
+  assert.deepEqual(simulate(g, {}).status, { t1: "succeeded", t2: "succeeded", a: "succeeded", b: "succeeded" });
 });
 
 test("planNext does nothing for a node that already ended", () => {
   const { graph } = validateGraph({ nodes: [trigger(), action("a")], edges: [edge("t", "a")] });
-  const state = startState(graph as Graph, null);
+  const state = startState(graph as Graph);
   assert.deepEqual(planNext(graph as Graph, state).ready, ["a"]);
   state.status.set("a", "succeeded");
   assert.deepEqual(planNext(graph as Graph, state).ready, []);
