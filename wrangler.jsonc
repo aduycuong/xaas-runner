@@ -28,7 +28,19 @@
     { "binding": "NODE_FB_PAGE_POST_V1_0_0", "service": "node-fb-page-post-v1-0-0" },
     { "binding": "NODE_GSHEET_APPEND_V1_0_0", "service": "node-gsheet-append-v1-0-0" },
     { "binding": "NODE_TELEGRAM_SEND_V1_0_0", "service": "node-telegram-send-v1-0-0" },
-    { "binding": "NODE_GDRIVE_READ_FILE_V1_0_0", "service": "node-gdrive-read-file-v1-0-0" }
+    { "binding": "NODE_GDRIVE_READ_FILE_V1_0_0", "service": "node-gdrive-read-file-v1-0-0" },
+    { "binding": "NODE_HUMAN_ASK_V1_0_0", "service": "node-human-ask-v1-0-0" },
+    { "binding": "NODE_HUMAN_ASK_V1_1_0", "service": "node-human-ask-v1-1-0" },
+    { "binding": "NODE_HUMAN_ASK_V2_0_0", "service": "node-human-ask-v2-0-0" },
+    { "binding": "NODE_HUMAN_ASK_V2_0_1", "service": "node-human-ask-v2-0-1" },
+    { "binding": "NODE_HUMAN_ASK_V2_1_0", "service": "node-human-ask-v2-1-0" },
+    { "binding": "NODE_NOTIFY_EMAIL_V2_0_0", "service": "node-notify-email-v2-0-0" },
+    { "binding": "NODE_HUMAN_ASK_V2_1_1", "service": "node-human-ask-v2-1-1" },
+    { "binding": "NODE_CORE_ECHO_V1_5_0", "service": "node-core-echo-v1-5-0" },
+    { "binding": "NODE_HUMAN_ASK_V3_0_0", "service": "node-human-ask-v3-0-0" },
+    { "binding": "NODE_HUMAN_ASK_V4_0_0", "service": "node-human-ask-v4-0-0" },
+    { "binding": "NODE_FB_COMMENT_REPLY_V1_0_0", "service": "node-fb-comment-reply-v1-0-0" },
+    { "binding": "NODE_FB_MESSENGER_SEND_V1_0_0", "service": "node-fb-messenger-send-v1-0-0" }
   ],
   "vars": {
     "QSTASH_URL": "https://qstash-eu-central-1.upstash.io",
