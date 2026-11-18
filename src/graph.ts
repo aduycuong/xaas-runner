@@ -43,17 +43,8 @@ const resourceChoiceSchema = z.union([
   z.object({ path: z.string().min(1).max(500) }),
 ]);
 
-/** Reads the first shape (`{ connections, secrets, variables }` of maps) as the flat one. */
-function flattenResources(value: unknown): unknown {
-  if (value == null) return {};
-  if (typeof value !== "object" || Array.isArray(value)) return value;
-  const groups = ["connections", "secrets", "variables"];
-  const entries = Object.entries(value as Record<string, unknown>);
-  const isOld = entries.length > 0 && entries.every(([key, inner]) => groups.includes(key) && inner !== null && typeof inner === "object" && !("connectionId" in inner) && !("path" in inner));
-  return isOld ? Object.assign({}, ...entries.map(([, inner]) => inner)) : value;
-}
-
-const resourcesSchema = z.preprocess(flattenResources, z.record(z.string(), resourceChoiceSchema));
+/** The choice of each resource by name; a node without resources has `{}`. */
+const resourcesSchema = z.preprocess((value) => value ?? {}, z.record(z.string(), resourceChoiceSchema));
 export type ResourceChoice = z.infer<typeof resourceChoiceSchema>;
 
 const settingsSchema = z
