@@ -40,7 +40,9 @@
     { "binding": "NODE_HUMAN_ASK_V3_0_0", "service": "node-human-ask-v3-0-0" },
     { "binding": "NODE_HUMAN_ASK_V4_0_0", "service": "node-human-ask-v4-0-0" },
     { "binding": "NODE_FB_COMMENT_REPLY_V1_0_0", "service": "node-fb-comment-reply-v1-0-0" },
-    { "binding": "NODE_FB_MESSENGER_SEND_V1_0_0", "service": "node-fb-messenger-send-v1-0-0" }
+    { "binding": "NODE_FB_MESSENGER_SEND_V1_0_0", "service": "node-fb-messenger-send-v1-0-0" },
+    { "binding": "NODE_FB_COMMENT_REPLY_V1_0_1", "service": "node-fb-comment-reply-v1-0-1" },
+    { "binding": "NODE_FB_MESSENGER_SEND_V1_0_1", "service": "node-fb-messenger-send-v1-0-1" }
   ],
   "vars": {
     "QSTASH_URL": "https://qstash-eu-central-1.upstash.io",
