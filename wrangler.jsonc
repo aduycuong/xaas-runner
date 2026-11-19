@@ -43,7 +43,8 @@
     { "binding": "NODE_FB_MESSENGER_SEND_V1_0_0", "service": "node-fb-messenger-send-v1-0-0" },
     { "binding": "NODE_FB_COMMENT_REPLY_V1_0_1", "service": "node-fb-comment-reply-v1-0-1" },
     { "binding": "NODE_FB_MESSENGER_SEND_V1_0_1", "service": "node-fb-messenger-send-v1-0-1" },
-    { "binding": "NODE_FB_LEAD_GET_V1_0_0", "service": "node-fb-lead-get-v1-0-0" }
+    { "binding": "NODE_FB_LEAD_GET_V1_0_0", "service": "node-fb-lead-get-v1-0-0" },
+    { "binding": "NODE_FB_LEAD_GET_V1_0_1", "service": "node-fb-lead-get-v1-0-1" }
   ],
   "vars": {
     "QSTASH_URL": "https://qstash-eu-central-1.upstash.io",
