@@ -44,7 +44,16 @@
     { "binding": "NODE_FB_COMMENT_REPLY_V1_0_1", "service": "node-fb-comment-reply-v1-0-1" },
     { "binding": "NODE_FB_MESSENGER_SEND_V1_0_1", "service": "node-fb-messenger-send-v1-0-1" },
     { "binding": "NODE_FB_LEAD_GET_V1_0_0", "service": "node-fb-lead-get-v1-0-0" },
-    { "binding": "NODE_FB_LEAD_GET_V1_0_1", "service": "node-fb-lead-get-v1-0-1" }
+    { "binding": "NODE_FB_LEAD_GET_V1_0_1", "service": "node-fb-lead-get-v1-0-1" },
+    { "binding": "NODE_IMAGE_FAL_V1_0_0", "service": "node-image-fal-v1-0-0" },
+    { "binding": "NODE_IMAGE_GEMINI_V1_0_0", "service": "node-image-gemini-v1-0-0" },
+    { "binding": "NODE_IMAGE_OPENAI_V1_0_0", "service": "node-image-openai-v1-0-0" },
+    { "binding": "NODE_IMAGE_REPLICATE_V1_0_0", "service": "node-image-replicate-v1-0-0" },
+    { "binding": "NODE_IMAGE_FAL_V1_1_0", "service": "node-image-fal-v1-1-0" },
+    { "binding": "NODE_IMAGE_COMPOSE_V1_0_0", "service": "node-image-compose-v1-0-0" },
+    { "binding": "NODE_IMAGE_TRANSFORM_V1_0_0", "service": "node-image-transform-v1-0-0" },
+    { "binding": "NODE_AI_LLM_V2_0_0", "service": "node-ai-llm-v2-0-0" },
+    { "binding": "NODE_AI_LLM_V2_1_0", "service": "node-ai-llm-v2-1-0" }
   ],
   "vars": {
     "QSTASH_URL": "https://qstash-eu-central-1.upstash.io",
