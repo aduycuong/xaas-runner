@@ -57,7 +57,7 @@ function harness(options: { fail?: string[] } = {}) {
       return { kind: "ended", result: { ends: [{ id, status: "succeeded" }], finished: false } };
     },
   };
-  let decide: ((wire: Parameters<Deps["runBuiltIns"]>[0]) => StepResult) | null = null;
+  let decide: ((wire: Parameters<Deps["runBuiltIns"]>[0]) => StepResult | Promise<StepResult>) | null = null;
   return { log, finished, deps, setDecide: (fn: typeof decide) => (decide = fn) };
 }
 
@@ -91,8 +91,8 @@ test("orchestrate: an if is decided in a flow step and the skipped branch is rec
   const plan = planOf(raw);
   const h = harness();
   const scope = { input: {}, trigger: {}, run: { id: "r", no: 1, env: "production" }, nodes: {} };
-  h.setDecide((wire) => {
-    const decided = decideBuiltIns(plan.graph, fromWire(wire), scope, {});
+  h.setDecide(async (wire) => {
+    const decided = await decideBuiltIns(plan.graph, fromWire(wire), scope, {});
     return { ends: decided.ends, finished: false };
   });
   await orchestrate(plan, h.deps);
