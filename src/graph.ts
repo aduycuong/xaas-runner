@@ -1,10 +1,11 @@
 // Workflow graph: format, validation, expressions, conditions and scheduling. Pure: no I/O.
 //
-// This file is declared three times, byte for byte: here, in xaas-workflows/lib/workflows/graph.ts
-// (the app validates and previews with it) and in xaas-ingress/src/graph.ts (webhook filters and
-// input mappings use its expressions and conditions). Change all together; the tests
-// (graph.test.ts) are copied to the app and the runner.
+// This file is declared three times, byte for byte: in workers/runner/src/graph.ts, in
+// xaas-workflows/lib/workflows/graph.ts (the app validates and previews with it) and in
+// workers/ingress/src/graph.ts (webhook filters and input mappings use its expressions and
+// conditions). Change all together; the tests (graph.test.ts) are copied to the app and the runner.
 
+import jsonata from "jsonata";
 import { z } from "zod";
 
 export type StoredError = { code: string; message: string };
@@ -35,12 +36,13 @@ const inputSchema = z.object({ mode: z.enum(["fixed", "expr"]), value: z.unknown
 
 /**
  * What a node resource is chosen to be, by the resource's name: a secret or variable name, or a connection id (string);
- * an item of a connection (Drive file or folder, channel, chat, Page); a path in workspace files.
+ * an item of a connection (Drive file or folder, channel, chat, Page); a path in workspace files (`""` is the workspace
+ * root, a folder only).
  */
 const resourceChoiceSchema = z.union([
   z.string().min(1).max(64),
   z.object({ connectionId: z.uuid(), id: z.string().min(1).max(200) }),
-  z.object({ path: z.string().min(1).max(500) }),
+  z.object({ path: z.string().max(500) }),
 ]);
 
 /** The choice of each resource by name; a node without resources has `{}`. */
@@ -125,8 +127,23 @@ const edgeSchema = z.object({
   targetHandle: z.string().default("in"),
 });
 
+/**
+ * The input schema of a workflow: a JSON Schema (draft 2020-12) of the run input, what nodes read as `{{ input.… }}`. Every
+ * trigger's mapping must make it; Run, Test, Fire now and webhook calls are checked against it. A workspace file or folder
+ * is a string with `format: "workspace-file"` / `"workspace-folder"` (its path).
+ */
+export const inputSchemaSchema = z
+  .record(z.string(), z.unknown())
+  .refine((schema) => schema.type === "object", { error: 'The input schema must describe an object ("type": "object").' })
+  .refine((schema) => JSON.stringify(schema).length <= 64 * 1024, { error: "The input schema is too large (64 KB at most)." });
+
 /** Shape of `workflow_versions.definition`. `position` and other editor data are ignored by the runner. */
-export const graphSchema = z.object({ nodes: z.array(nodeSchema).min(1), edges: z.array(edgeSchema).default([]) });
+export const graphSchema = z.object({
+  nodes: z.array(nodeSchema).min(1),
+  edges: z.array(edgeSchema).default([]),
+  /** The input schema of the workflow (see `inputSchemaSchema`); without it any input is accepted. */
+  inputSchema: inputSchemaSchema.optional(),
+});
 
 export type Graph = z.infer<typeof graphSchema>;
 export type GraphNode = Graph["nodes"][number];
@@ -139,7 +156,10 @@ export type MergeNode = z.infer<typeof mergeNode>;
 export type Issue = { nodeId: string | null; path: string; message: string };
 
 // ---------------------------------------------------------------------------
-// Expressions: {{ input.x }} · {{ trigger.body.x }} · {{ nodes.<id>.output.items[0].name }} · {{ run.id }} · {{ x | default("n/a") }}
+// Expressions: the inside of each `{{ … }}` is JSONata (https://jsonata.org), read against the scope
+// `{ input, trigger, nodes, run }`: {{ input.x }} · {{ trigger.body.x }} · {{ nodes.<id>.output.items[0].name }}
+// · {{ "Hi " & input.name }} · {{ input.vip ? "VIP" : "guest" }} · {{ $number(input.age) }} · {{ $count(nodes.a.output.items) }}.
+// A node id or field that is not a plain name goes in backticks: {{ nodes.`my-node`.output }}.
 // ---------------------------------------------------------------------------
 
 export type Scope = {
@@ -151,122 +171,214 @@ export type Scope = {
   nodes: Record<string, { output: unknown }>;
 };
 
-/** An expression names a value that is missing, or uses something not available. Retrying cannot fix it. */
+/** An expression cannot be read, names a value that is missing, fails, or uses something not available. Retrying cannot fix it. */
 export class ExpressionError extends Error {}
 
-const WHOLE = /^\s*\{\{([\s\S]+?)\}\}\s*$/;
-const PART = /\{\{([\s\S]+?)\}\}/g;
-const SEGMENT = /^[A-Za-z_][A-Za-z0-9_-]*/;
+/** A path an expression reads from the scope: `nodes.a.output.items[0]` is root `nodes`, segments `["a", "output", "items", 0]`. */
+export type ExpressionRef = { root: string; segments: (string | number)[] };
 
-type Path = { root: string; segments: (string | number)[]; fallback: { value: unknown } | null };
+/** One piece of a text: plain text, or the inside of one `{{ … }}`. */
+export type TemplatePart = { kind: "text"; text: string } | { kind: "expr"; source: string };
 
-/** Parses the inside of one `{{ … }}`. */
-export function parseExpression(source: string): Path {
-  let text = source.trim();
-  let fallback: Path["fallback"] = null;
-  const withDefault = /^([\s\S]*?)\s*\|\s*default\(([\s\S]*)\)$/.exec(text);
-  if (withDefault) {
-    try {
-      fallback = { value: JSON.parse(withDefault[2]) };
-    } catch {
-      throw new ExpressionError(`default(...) needs a JSON value in "{{ ${text} }}".`);
+const ROOTS = ["input", "trigger", "nodes", "run"];
+/** Evaluation steps and nesting allowed for one expression (Workers stop the clock during CPU work, so steps, not time). */
+const MAX_STEPS = 100_000;
+const MAX_DEPTH = 200;
+const ENTRY_HOOK = Symbol.for("jsonata.__evaluate_entry");
+const EXIT_HOOK = Symbol.for("jsonata.__evaluate_exit");
+
+type Ast = { type?: string; value?: unknown; steps?: Ast[]; stages?: Ast[]; expr?: Ast; [key: string]: unknown };
+type JsonataError = { code?: string; message?: string; position?: number; token?: string };
+
+function describe(error: unknown): string {
+  const { message, position, token } = (error ?? {}) as JsonataError;
+  const where = typeof position === "number" ? ` (at ${position}${token ? `, near "${token}"` : ""})` : "";
+  return `${message ?? String(error)}${where}`;
+}
+
+/**
+ * Splits a text into plain text and `{{ … }}` expressions. Braces and quoted strings inside an expression are
+ * balanced, so `{{ {"a": {"b": 1}} }}` is one expression. An unclosed `{{` is plain text.
+ */
+export function templateParts(text: string): TemplatePart[] {
+  const parts: TemplatePart[] = [];
+  let from = 0;
+  let open = text.indexOf("{{");
+  while (open >= 0) {
+    let depth = 0;
+    let quote: string | null = null;
+    let end = -1;
+    for (let i = open + 2; i < text.length; i++) {
+      const c = text[i];
+      if (quote) {
+        if (c === "\\" && quote !== "`") i++;
+        else if (c === quote) quote = null;
+      } else if (c === '"' || c === "'" || c === "`") quote = c;
+      else if (c === "{") depth++;
+      else if (c === "}") {
+        if (depth > 0) depth--;
+        else if (text[i + 1] === "}") {
+          end = i;
+          break;
+        }
+      }
     }
-    text = withDefault[1].trim();
+    if (end < 0) break;
+    if (open > from) parts.push({ kind: "text", text: text.slice(from, open) });
+    parts.push({ kind: "expr", source: text.slice(open + 2, end) });
+    from = end + 2;
+    open = text.indexOf("{{", from);
   }
+  if (from < text.length) parts.push({ kind: "text", text: text.slice(from) });
+  return parts;
+}
 
-  const root = SEGMENT.exec(text)?.[0];
-  if (!root) throw new ExpressionError(`"{{ ${text} }}" does not start with a name.`);
-  let rest = text.slice(root.length);
+/** The leading names and fixed indexes of a path that starts at a root name. */
+function refOf(steps: Ast[]): ExpressionRef {
   const segments: (string | number)[] = [];
-  while (rest.length) {
-    const index = /^\[(\d+)\]/.exec(rest);
-    if (index) {
-      segments.push(Number(index[1]));
-      rest = rest.slice(index[0].length);
-      continue;
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (step.type !== "name" || typeof step.value !== "string") break;
+    if (i > 0) segments.push(step.value);
+    const stages = step.stages ?? [];
+    const index = stages.length === 1 && stages[0].type === "filter" && stages[0].expr?.type === "number" ? stages[0].expr.value : undefined;
+    if (stages.length > 0) {
+      if (typeof index !== "number" || !Number.isInteger(index) || index < 0) break;
+      segments.push(index);
     }
-    const name = rest.startsWith(".") ? SEGMENT.exec(rest.slice(1))?.[0] : undefined;
-    if (!name) throw new ExpressionError(`"{{ ${text} }}" has a path that cannot be read.`);
-    segments.push(name);
-    rest = rest.slice(1 + name.length);
+    if (step.group || step.focus || step.index || step.tuple) break;
   }
-
-  if (root === "vars" || root === "secrets") throw new ExpressionError(`"${root}" is not an expression: a node reads secrets and variables by name, in the environment of the run.`);
-  if (root === "files") throw new ExpressionError(`"files" is not an expression: choose the file or its folder in the node's Resources tab.`);
-  if (!["input", "trigger", "nodes", "run"].includes(root)) throw new ExpressionError(`Unknown source "${root}" in "{{ ${text} }}". Use input, trigger, nodes or run.`);
-  if (root === "nodes" && (typeof segments[0] !== "string" || segments[1] !== "output")) {
-    throw new ExpressionError(`"{{ ${text} }}" must look like nodes.<id>.output...`);
-  }
-  return { root, segments, fallback };
+  return { root: steps[0].value as string, segments };
 }
 
-/** Value at a parsed path, or `undefined` when something on the way is missing. */
-function readPath(path: Path, scope: Scope): unknown {
-  let current: unknown;
-  let segments = path.segments;
-  if (path.root === "input") current = scope.input;
-  else if (path.root === "trigger") current = scope.trigger;
-  else if (path.root === "run") current = scope.run;
-  else {
-    const entry = scope.nodes[segments[0] as string];
-    if (!entry) return undefined;
-    current = entry.output;
-    segments = segments.slice(2);
+/**
+ * Collects the paths an expression reads from the scope. Names at the top level (and in function arguments,
+ * conditions, blocks, constructors) start at the scope; names inside a filter or after a step are relative.
+ */
+function collectRefs(node: unknown, top: boolean, refs: ExpressionRef[]): void {
+  if (Array.isArray(node)) {
+    for (const item of node) collectRefs(item, top, refs);
+    return;
   }
-  for (const segment of segments) {
-    if (Array.isArray(current) && segment === "length") current = current.length;
-    else if (Array.isArray(current) && typeof segment === "number") current = current[segment];
-    else if (current !== null && typeof current === "object" && typeof segment === "string" && Object.hasOwn(current, segment)) {
-      current = (current as Record<string, unknown>)[segment];
-    } else return undefined;
+  if (node === null || typeof node !== "object") return;
+  const ast = node as Ast;
+  if (ast.type === "path" && Array.isArray(ast.steps) && ast.steps.length > 0) {
+    const [first, ...rest] = ast.steps;
+    if (top && first.type === "name") {
+      refs.push(refOf(ast.steps));
+      for (const [key, value] of Object.entries(first)) if (key !== "value" && key !== "type") collectRefs(value, false, refs);
+    } else collectRefs(first, top, refs);
+    collectRefs(rest, false, refs);
+    for (const [key, value] of Object.entries(ast)) if (key !== "steps") collectRefs(value, false, refs);
+    return;
   }
-  return current;
+  if (top && ast.type === "name" && typeof ast.value === "string") {
+    refs.push({ root: ast.value, segments: [] });
+    return;
+  }
+  for (const [key, value] of Object.entries(ast)) if (key !== "position") collectRefs(value, top, refs);
 }
 
-function evaluateToken(source: string, scope: Scope, strict: boolean): unknown {
-  const path = parseExpression(source);
-  const value = readPath(path, scope);
-  if (value !== undefined) return value;
-  if (path.fallback) return path.fallback.value;
+function compile(source: string): { expression: ReturnType<typeof jsonata>; refs: ExpressionRef[] } {
+  const text = source.trim();
+  if (!text) throw new ExpressionError(`"{{ }}" is empty.`);
+  let expression: ReturnType<typeof jsonata>;
+  try {
+    expression = jsonata(text);
+  } catch (error) {
+    throw new ExpressionError(`"{{ ${text} }}" cannot be read: ${describe(error)}.`);
+  }
+  const refs: ExpressionRef[] = [];
+  collectRefs(expression.ast(), true, refs);
+  for (const { root, segments } of refs) {
+    if (root === "vars" || root === "secrets") throw new ExpressionError(`"${root}" is not an expression: a node reads secrets and variables by name, in the environment of the run.`);
+    if (root === "files") throw new ExpressionError(`"files" is not an expression: choose the file or its folder in the node's Resources tab.`);
+    if (!ROOTS.includes(root)) throw new ExpressionError(`Unknown source "${root}" in "{{ ${text} }}". Use input, trigger, nodes or run.`);
+    if (root === "nodes" && (typeof segments[0] !== "string" || segments[1] !== "output")) {
+      throw new ExpressionError(`"{{ ${text} }}" must look like nodes.<id>.output...`);
+    }
+  }
+  return { expression, refs };
+}
+
+/** Checks the inside of one `{{ … }}` (JSONata syntax, known sources) and lists the paths it reads. */
+export function parseExpression(source: string): ExpressionRef[] {
+  return compile(source).refs;
+}
+
+async function evaluateToken(source: string, scope: Scope, strict: boolean): Promise<unknown> {
+  const { expression } = compile(source);
+  let steps = 0;
+  let depth = 0;
+  expression.assign(ENTRY_HOOK as unknown as string, () => {
+    steps++;
+    depth++;
+    if (steps > MAX_STEPS) throw { code: "BUDGET", message: `The expression took more than ${MAX_STEPS} steps.` };
+    if (depth > MAX_DEPTH) throw { code: "BUDGET", message: `The expression nested deeper than ${MAX_DEPTH} levels.` };
+  });
+  expression.assign(EXIT_HOOK as unknown as string, () => {
+    depth--;
+  });
+  let value: unknown;
+  try {
+    value = await expression.evaluate(scope);
+  } catch (error) {
+    if (!strict) return undefined;
+    throw new ExpressionError(`"{{ ${source.trim()} }}" failed: ${describe(error)}.`);
+  }
+  // JSONata sequences carry hidden flags and a function is not data: a JSON round trip gives plain values.
+  const json = value === undefined ? undefined : JSON.stringify(value);
+  if (json !== undefined) return JSON.parse(json);
   if (strict) throw new ExpressionError(`"{{ ${source.trim()} }}" has no value.`);
   return undefined;
 }
 
 /**
  * Replaces expressions in a JSON value. A string that is one expression keeps the type of its
- * value; inside a longer string values become text. `strict` makes a missing value an error
- * (action inputs); lenient gives `undefined` (conditions).
+ * value; inside a longer string values become text. `strict` makes a missing value or a failed
+ * evaluation an error (action inputs); lenient gives `undefined` (conditions). An expression that
+ * cannot be read is an error either way.
  */
-export function resolveValue(value: unknown, scope: Scope, strict = true): unknown {
+export async function resolveValue(value: unknown, scope: Scope, strict = true): Promise<unknown> {
   if (typeof value === "string") {
-    const whole = WHOLE.exec(value);
-    if (whole && !/\}\}[\s\S]*\{\{/.test(value)) return evaluateToken(whole[1], scope, strict);
-    return value.replace(PART, (_match, source: string) => {
-      const found = evaluateToken(source, scope, strict);
-      return found === undefined ? "" : typeof found === "string" ? found : JSON.stringify(found);
-    });
+    const parts = templateParts(value);
+    const expressions = parts.filter((part) => part.kind === "expr");
+    if (expressions.length === 0) return value;
+    if (expressions.length === 1 && parts.every((part) => part.kind === "expr" || part.text.trim() === "")) {
+      return evaluateToken(expressions[0].source, scope, strict);
+    }
+    let out = "";
+    for (const part of parts) {
+      if (part.kind === "text") out += part.text;
+      else {
+        const found = await evaluateToken(part.source, scope, strict);
+        out += found === undefined ? "" : typeof found === "string" ? found : JSON.stringify(found);
+      }
+    }
+    return out;
   }
-  if (Array.isArray(value)) return value.map((item) => resolveValue(item, scope, strict));
+  if (Array.isArray(value)) return Promise.all(value.map((item) => resolveValue(item, scope, strict)));
   if (value !== null && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, resolveValue(item, scope, strict)]));
+    const entries = await Promise.all(Object.entries(value).map(async ([key, item]) => [key, await resolveValue(item, scope, strict)] as const));
+    return Object.fromEntries(entries);
   }
   return value;
 }
 
 /** Every `{{ … }}` source inside a value, for checking references without running anything. */
 export function collectExpressions(value: unknown): string[] {
-  if (typeof value === "string") return [...value.matchAll(PART)].map((match) => match[1]);
+  if (typeof value === "string") return templateParts(value).flatMap((part) => (part.kind === "expr" ? [part.source] : []));
   if (Array.isArray(value)) return value.flatMap(collectExpressions);
   if (value !== null && typeof value === "object") return Object.values(value).flatMap(collectExpressions);
   return [];
 }
 
 /** Resolves the `inputs` of an action: `fixed` values are used as written, `expr` values are expressions. */
-export function resolveInputs(inputs: ActionNode["data"]["inputs"], scope: Scope): Record<string, unknown> {
+export async function resolveInputs(inputs: ActionNode["data"]["inputs"], scope: Scope): Promise<Record<string, unknown>> {
   const out: Record<string, unknown> = {};
   for (const [name, input] of Object.entries(inputs)) {
     try {
-      out[name] = input.mode === "expr" ? resolveValue(input.value, scope, true) : input.value;
+      out[name] = input.mode === "expr" ? await resolveValue(input.value, scope, true) : input.value;
     } catch (error) {
       if (error instanceof ExpressionError) throw new ExpressionError(`Input "${name}": ${error.message}`);
       throw error;
@@ -313,22 +425,28 @@ export function compare(op: Operator, left: unknown, right: unknown): boolean {
   }
 }
 
-/** A missing value counts as empty here: `is_empty` is true and comparisons are false. */
-function resolveLenient(value: unknown, scope: Scope): unknown {
-  return resolveValue(value, scope, false);
+/** A missing value, or one whose expression fails, counts as empty here: `is_empty` is true and comparisons are false. */
+async function resolveLenient(value: unknown, scope: Scope): Promise<unknown> {
+  try {
+    return await resolveValue(value, scope, false);
+  } catch (error) {
+    if (error instanceof ExpressionError) return undefined;
+    throw error;
+  }
 }
 
 /** Handle (`true` / `false`) an `if` node takes. */
-export function evaluateIf(node: IfNode, scope: Scope): "true" | "false" {
-  const results = node.data.conditions.map((c) => compare(c.op, resolveLenient(c.left, scope), resolveLenient(c.right, scope)));
+export async function evaluateIf(node: IfNode, scope: Scope): Promise<"true" | "false"> {
+  const results: boolean[] = [];
+  for (const c of node.data.conditions) results.push(compare(c.op, await resolveLenient(c.left, scope), await resolveLenient(c.right, scope)));
   return (node.data.join === "and" ? results.every(Boolean) : results.some(Boolean)) ? "true" : "false";
 }
 
 /** Handle a `switch` node takes: the first matching case, `default`, or null when nothing matches and there is no default. */
-export function evaluateSwitch(node: SwitchNode, scope: Scope): string | null {
-  const value = resolveLenient(node.data.value, scope);
-  const match = node.data.cases.find((c) => compare(c.op, value, resolveLenient(c.right, scope)));
-  return match ? match.id : node.data.fallback ? "default" : null;
+export async function evaluateSwitch(node: SwitchNode, scope: Scope): Promise<string | null> {
+  const value = await resolveLenient(node.data.value, scope);
+  for (const c of node.data.cases) if (compare(c.op, value, await resolveLenient(c.right, scope))) return c.id;
+  return node.data.fallback ? "default" : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -445,10 +563,11 @@ export function validateGraph(input: unknown): { graph: Graph | null; issues: Is
     const before = ancestors(node.id);
     for (const source of expressionsOf(node).flatMap(collectExpressions)) {
       try {
-        const path = parseExpression(source);
-        const ref = path.root === "nodes" ? (path.segments[0] as string) : null;
-        if (ref !== null && !byId.has(ref)) add(node.id, "data", `"{{ ${source.trim()} }}" refers to unknown node "${ref}".`);
-        else if (ref !== null && !before.has(ref)) add(node.id, "data", `"${ref}" does not come before "${node.id}", so "{{ ${source.trim()} }}" cannot be used.`);
+        for (const path of parseExpression(source)) {
+          const ref = path.root === "nodes" ? (path.segments[0] as string) : null;
+          if (ref !== null && !byId.has(ref)) add(node.id, "data", `"{{ ${source.trim()} }}" refers to unknown node "${ref}".`);
+          else if (ref !== null && !before.has(ref)) add(node.id, "data", `"${ref}" does not come before "${node.id}", so "{{ ${source.trim()} }}" cannot be used.`);
+        }
       } catch (error) {
         if (!(error instanceof ExpressionError)) throw error;
         add(node.id, "data", error.message);

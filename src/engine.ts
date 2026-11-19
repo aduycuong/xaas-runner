@@ -292,7 +292,7 @@ function rowsForSkipped(graph: Graph, ids: string[]): Written[] {
  * Decides every built-in node that is ready, and the built-ins that become ready after them,
  * without touching the database. Returns what to write and what to tell the function body.
  */
-export function decideBuiltIns(graph: Graph, state: RunState, scope: Scope, outputs: Record<string, unknown>) {
+export async function decideBuiltIns(graph: Graph, state: RunState, scope: Scope, outputs: Record<string, unknown>) {
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
   const ends: NodeEnd[] = [];
   const writes: Written[] = [];
@@ -306,10 +306,10 @@ export function decideBuiltIns(graph: Graph, state: RunState, scope: Scope, outp
       let output: unknown;
       let taken: string | null | undefined;
       if (node.type === "if") {
-        taken = evaluateIf(node, scope);
+        taken = await evaluateIf(node, scope);
         output = { taken };
       } else if (node.type === "switch") {
-        taken = evaluateSwitch(node, scope);
+        taken = await evaluateSwitch(node, scope);
         output = { taken };
       } else {
         output = mergeOutput(node.id, graph, state, outputs);
@@ -334,7 +334,7 @@ export async function runBuiltIns(sql: Sql, runId: string, wire: WireState, pend
 
   const state = fromWire(wire);
   const { scope, outputs } = buildScope(read.run, runId, read.nodeRuns);
-  const decided = decideBuiltIns(graph, state, scope, outputs);
+  const decided = await decideBuiltIns(graph, state, scope, outputs);
   const rows = [...rowsForSkipped(graph, [...pendingSkips, ...decided.skipped]), ...decided.writes];
   const queries = writeNodeRuns(sql, runId, rows);
   if (queries.length) await sql.transaction(queries);
@@ -472,7 +472,7 @@ async function afterNodeEnd(sql: Sql, scope: ActionScope, end: NodeEnd, nodeOutp
   const state = fromWire(options.wire);
   state.status.set(scope.node.id, end.status);
   const { scope: exprScope, outputs } = buildScope(scope.run, scope.runId, scope.nodeRuns, { [scope.node.id]: nodeOutput });
-  const decided = decideBuiltIns(scope.graph, state, exprScope, outputs);
+  const decided = await decideBuiltIns(scope.graph, state, exprScope, outputs);
   ends.push(...decided.ends);
   const rows = [...rowsForSkipped(scope.graph, decided.skipped), ...decided.writes];
   const queries = writeNodeRuns(sql, scope.runId, rows);
@@ -507,7 +507,7 @@ async function prepareCall(sql: Sql, scope: ActionScope): Promise<Prepared> {
     const { scope: exprScope } = buildScope(run, runId, nodeRuns);
     let input: Record<string, unknown> | null = null;
     try {
-      input = resolveInputs(node.data.inputs, exprScope);
+      input = await resolveInputs(node.data.inputs, exprScope);
     } catch {
       input = null;
     }
@@ -529,7 +529,7 @@ async function prepareCall(sql: Sql, scope: ActionScope): Promise<Prepared> {
   }
   const { scope: exprScope } = buildScope(run, runId, nodeRuns);
   try {
-    return { kind: "call", version, input: resolveInputs(node.data.inputs, exprScope) };
+    return { kind: "call", version, input: await resolveInputs(node.data.inputs, exprScope) };
   } catch (error) {
     if (!(error instanceof ExpressionError)) throw error;
     const failure = { code: "EXPRESSION_ERROR", message: `Node "${nodeId}": ${error.message}` };
