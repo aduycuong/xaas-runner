@@ -62,7 +62,9 @@
     { "binding": "NODE_IMAGE_REPLICATE_V1_1_0", "service": "node-image-replicate-v1-1-0" },
     { "binding": "NODE_IMAGE_COMPOSE_V1_1_0", "service": "node-image-compose-v1-1-0" },
     { "binding": "NODE_IMAGE_TRANSFORM_V1_1_0", "service": "node-image-transform-v1-1-0" },
-    { "binding": "NODE_AI_LLM_V2_3_0", "service": "node-ai-llm-v2-3-0" }
+    { "binding": "NODE_AI_LLM_V2_3_0", "service": "node-ai-llm-v2-3-0" },
+    { "binding": "NODE_IMAGE_GEMINI_V1_1_1", "service": "node-image-gemini-v1-1-1" },
+    { "binding": "NODE_AI_LLM_V2_3_1", "service": "node-ai-llm-v2-3-1" }
   ],
   "vars": {
     "QSTASH_URL": "https://qstash-eu-central-1.upstash.io",
