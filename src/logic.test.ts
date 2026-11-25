@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bindingName, judgeNodeOutcome, retryDelay } from "./logic";
+import { bindingName, hashCacheKey, judgeNodeOutcome, readCacheKey, retryDelay } from "./logic";
+
+test("cache key: a non-empty string, null for an input the node does not cache, anything else fails", () => {
+  const answer = (status: number, body: unknown) => readCacheKey({ kind: "response", status, body }, 20);
+  assert.deepEqual(answer(200, { key: "image:abc" }), { kind: "key", key: "image:abc" });
+  assert.deepEqual(answer(200, { key: null }), { kind: "none" });
+  for (const body of [null, {}, { key: "" }, { key: 3 }, { key: "x".repeat(21) }]) assert.equal(answer(200, body).kind, "failed");
+  assert.deepEqual(answer(404, { error: { code: "NOT_FOUND", message: "Unknown route." } }), { kind: "failed", message: "it answered 404: Unknown route." });
+  assert.equal(readCacheKey({ kind: "timeout" }, 20).kind, "failed");
+});
+
+test("cache key hash: sha256 hex, the same for the same key", async () => {
+  assert.equal(await hashCacheKey("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  assert.notEqual(await hashCacheKey("a"), await hashCacheKey("b"));
+});
 
 test("node outcome: 2xx needs an output object", () => {
   assert.deepEqual(judgeNodeOutcome({ kind: "response", status: 200, body: { output: { a: 1 } } }), {

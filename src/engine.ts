@@ -26,8 +26,19 @@ import {
   type Scope,
   type StoredError,
 } from "./graph";
-import { clampToRange, MAX_ATTEMPTS, MAX_WAIT_MS, POLL_ERRORS_IN_A_ROW, TIMEOUT_MS } from "./limits";
-import { judgeCallbackBody, judgeNodeOutcome, judgePollOutcome, retryDelay, retryDelayMs, uuidv7, type NodeOutcome, type NodeVerdict } from "./logic";
+import { CACHE_KEY_TIMEOUT_MS, clampToRange, MAX_ATTEMPTS, MAX_CACHE_KEY_CHARS, MAX_CACHE_TTL_S, MAX_WAIT_MS, POLL_ERRORS_IN_A_ROW, TIMEOUT_MS } from "./limits";
+import {
+  hashCacheKey,
+  judgeCallbackBody,
+  judgeNodeOutcome,
+  judgePollOutcome,
+  readCacheKey,
+  retryDelay,
+  retryDelayMs,
+  uuidv7,
+  type NodeOutcome,
+  type NodeVerdict,
+} from "./logic";
 import { derivedResourceToken, newResourceToken, RESOURCE_TOKEN_GRACE_MS } from "./resource-token";
 
 export type { Sql };
@@ -223,7 +234,7 @@ type RunRow = {
   definition: unknown;
 };
 type NodeRunRow = { node_id: string; status: string; output: unknown; error: StoredError | null };
-type VersionRow = { id: string; key: string; version: string; script_name: string; transport: string; timeout_ms: number; retry_max_attempts: number };
+type VersionRow = { id: string; key: string; version: string; script_name: string; transport: string; timeout_ms: number; retry_max_attempts: number; cache: boolean };
 
 async function readRun(sql: Sql, runId: string): Promise<{ run: RunRow; nodeRuns: NodeRunRow[] } | null> {
   const [runs, nodeRuns] = await sql.transaction([
@@ -347,7 +358,7 @@ export async function runBuiltIns(sql: Sql, runId: string, wire: WireState, pend
 
 async function loadVersion(sql: Sql, node: ActionNode): Promise<VersionRow | null> {
   const [row] = await sql`
-    select nv.id, n.key, nv.version, nv.script_name, nv.transport, nv.timeout_ms, nv.retry_max_attempts
+    select nv.id, n.key, nv.version, nv.script_name, nv.transport, nv.timeout_ms, nv.retry_max_attempts, nv.cache
     from node_versions nv join nodes n on n.id = nv.node_id
     where n.key = ${node.data.nodeKey} and nv.version = ${node.data.version}`;
   return (row as unknown as VersionRow) ?? null;
@@ -435,7 +446,7 @@ async function settleAttempt(
       sql`update attempts set status = 'succeeded', http_status = coalesce(${verdict.httpStatus}::int, http_status), request = coalesce(${request}::jsonb, request),
             response = coalesce(${response}::jsonb, response), finished_at = now()
           where node_run_id = ${nodeRunId} and attempt = ${attempt}`,
-      sql`update node_runs set status = ${status}, output = ${json(verdict.output)}::jsonb, attempt_count = ${attempt}, finished_at = now() where id = ${nodeRunId}`,
+      succeedNodeRun(sql, scope, nodeRunId, status, verdict.output, attempt),
       sql`insert into run_logs (id, run_id, node_run_id, level, message) values (${uuidv7()}, ${runId}, ${nodeRunId}, 'info', ${attempt > 1 ? `Succeeded on attempt ${attempt}` : "Succeeded"})`,
     ]);
     return { kind: "ok", end: { id: node.id, status }, nodeOutput: verdict.output };
@@ -462,6 +473,98 @@ async function settleAttempt(
   }
   await sql.transaction([...skipRows, attemptRow, log]);
   return { kind: "ended", result: await finishAfterFailure(sql, scope.runId, node, verdict.error, nodeRunId) };
+}
+
+// ---------------------------------------------------------------------------
+// Node cache (`data.settings.cacheTtl` of a node whose version has `cache`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Ends a node run that succeeded. When attempt 1 got a cache key (`node_runs.cache_key`), the output is also stored in
+ * `node_cache` under it, for the workspace, node version and environment of the run, until the run's TTL is over.
+ */
+function succeedNodeRun(sql: Sql, scope: ActionScope, nodeRunId: string, status: NodeStatus, output: unknown, attempt: number): Query {
+  const ttl = Math.min(scope.node.data.settings.cacheTtl, MAX_CACHE_TTL_S);
+  return sql`
+    with nr as (
+      update node_runs set status = ${status}, output = ${json(output)}::jsonb, attempt_count = ${attempt}, finished_at = now() where id = ${nodeRunId}
+      returning id, cache_key, output
+    )
+    insert into node_cache (workspace_id, node_key, node_version, env, key, output, node_run_id, expires_at)
+    select ${scope.run.workspace_id}::uuid, ${scope.node.data.nodeKey}, ${scope.node.data.version}, ${scope.run.env}, nr.cache_key, nr.output, nr.id,
+      now() + ${ttl}::float8 * interval '1 second'
+    from nr where nr.cache_key is not null and ${ttl}::float8 > 0
+    on conflict (workspace_id, node_key, node_version, env, key) do update
+      set output = excluded.output, node_run_id = excluded.node_run_id, created_at = now(), expires_at = excluded.expires_at`;
+}
+
+/** How long attempt 1 of this node may spend on `POST /cache-key`; 0 when the node is not cached. */
+function cacheKeyTimeoutMs(scope: ActionScope, version: VersionRow, timeoutMs: number): number {
+  return version.cache && scope.node.data.settings.cacheTtl > 0 ? Math.min(timeoutMs, CACHE_KEY_TIMEOUT_MS) : 0;
+}
+
+type CacheLookup = { kind: "hit"; key: string; output: unknown; storedAt: string } | { kind: "miss" };
+
+/**
+ * Attempt 1 of a node the workflow caches: asks the node for the key of its input (`POST /cache-key`, with the
+ * attempt's headers and run token), keeps its sha256 on the node run and looks it up. An entry younger than the
+ * node's TTL is a hit. A node that gives no key, or fails to, is a miss: it runs as usual.
+ */
+async function lookUpCache(
+  sql: Sql,
+  callNode: CallNode,
+  scope: ActionScope,
+  version: VersionRow,
+  input: Record<string, unknown>,
+  nodeRunId: string,
+  attempt: number,
+  headers: Record<string, string>,
+  timeoutMs: number,
+): Promise<CacheLookup> {
+  const keyTimeoutMs = cacheKeyTimeoutMs(scope, version, timeoutMs);
+  if (!keyTimeoutMs || attempt !== 1) return { kind: "miss" };
+  const { run, runId, node } = scope;
+  const outcome = await callNode({
+    scriptName: version.script_name,
+    transport: version.transport,
+    timeoutMs: keyTimeoutMs,
+    headers,
+    body: JSON.stringify(envelopeFor(scope, version, input)),
+    path: "/cache-key",
+    method: "POST",
+  });
+  const answer = readCacheKey(outcome, MAX_CACHE_KEY_CHARS);
+  if (answer.kind !== "key") {
+    const message = answer.kind === "none" ? "The node gave no cache key for this input: it runs." : `No cache key, ${answer.message}: the node runs.`;
+    await sql`insert into run_logs (id, run_id, node_run_id, level, message) values (${uuidv7()}, ${runId}, ${nodeRunId}, ${answer.kind === "none" ? "info" : "warn"}, ${message})`;
+    return { kind: "miss" };
+  }
+  const key = await hashCacheKey(answer.key);
+  const ttl = Math.min(node.data.settings.cacheTtl, MAX_CACHE_TTL_S);
+  const [, found] = await sql.transaction([
+    sql`update node_runs set cache_key = ${key} where id = ${nodeRunId}`,
+    sql`select output, created_at from node_cache
+        where workspace_id = ${run.workspace_id}::uuid and node_key = ${node.data.nodeKey} and node_version = ${node.data.version} and env = ${run.env} and key = ${key}
+          and created_at > now() - ${ttl}::float8 * interval '1 second'
+        limit 1`,
+  ]);
+  const row = (found as unknown as { output: unknown; created_at: Date | string }[])[0];
+  return row ? { kind: "hit", key, output: row.output, storedAt: new Date(row.created_at).toISOString() } : { kind: "miss" };
+}
+
+/** A cache hit ends attempt 1 and the node run with the stored output; the node is not run. */
+async function settleCacheHit(sql: Sql, scope: ActionScope, nodeRunId: string, attempt: number, hit: Extract<CacheLookup, { kind: "hit" }>, request: string) {
+  const { runId, node, skipRows } = scope;
+  await sql.transaction([
+    ...skipRows,
+    sql`update attempts set status = 'succeeded', http_status = 200, request = ${request}::jsonb,
+          response = ${json({ cache: "hit", key: hit.key, stored_at: hit.storedAt })}::jsonb, finished_at = now()
+        where node_run_id = ${nodeRunId} and attempt = ${attempt}`,
+    sql`update node_runs set status = 'succeeded', output = ${json(hit.output)}::jsonb, cache_hit = true, attempt_count = ${attempt}, finished_at = now() where id = ${nodeRunId}`,
+    sql`insert into run_logs (id, run_id, node_run_id, level, message) values (${uuidv7()}, ${runId}, ${nodeRunId}, 'info', ${`Used the cached output stored at ${hit.storedAt}: the node was not run.`})`,
+  ]);
+  const end: NodeEnd = { id: node.id, status: "succeeded" };
+  return { end, nodeOutput: hit.output };
 }
 
 /** After a node ended well: alone in its wave, the step also decides what follows and may end the run. */
@@ -583,6 +686,8 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
 
   const maxAttempts = clampToRange(node.data.settings.maxAttempts ?? version.retry_max_attempts, MAX_ATTEMPTS);
   const timeoutMs = clampToRange(node.data.settings.timeout ?? version.timeout_ms, TIMEOUT_MS);
+  // Attempt 1 of a cached node also asks for its cache key, with the same token.
+  const keyTimeoutMs = cacheKeyTimeoutMs(scope, version, timeoutMs);
   // The run token of this attempt: the node shows it to xaas-resource-broker. Only its hash is stored (with the attempt).
   const resourceToken = await newResourceToken();
   const [nodeRun] = await sql`
@@ -593,7 +698,7 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
       returning id, attempt_count
     ), at as (
       insert into attempts (id, node_run_id, attempt, resource_token_hash, resource_token_expires_at)
-      select ${uuidv7()}::uuid, nr.id, nr.attempt_count, ${resourceToken.hash}, now() + ${timeoutMs + RESOURCE_TOKEN_GRACE_MS} * interval '1 millisecond'
+      select ${uuidv7()}::uuid, nr.id, nr.attempt_count, ${resourceToken.hash}, now() + ${timeoutMs + keyTimeoutMs + RESOURCE_TOKEN_GRACE_MS} * interval '1 millisecond'
       from nr where nr.attempt_count <= ${maxAttempts}::int
       on conflict (node_run_id, attempt) do nothing
     )
@@ -611,6 +716,11 @@ export async function executeAction(sql: Sql, runId: string, nodeId: string, cal
   // Sent to the node, never stored: `headers` (what `attempts.request` keeps) leaves it out.
   const sentHeaders = { ...headers, "X-XAAS-Resource-Token": resourceToken.token };
   const envelope = envelopeFor(scope, version, input);
+  const cached = await lookUpCache(sql, callNode, scope, version, input, nodeRunId, attempt, sentHeaders, timeoutMs);
+  if (cached.kind === "hit") {
+    const done = await settleCacheHit(sql, scope, nodeRunId, attempt, cached, json({ headers, path: "/cache-key", body: envelope }));
+    return afterNodeEnd(sql, scope, done.end, done.nodeOutput, options);
+  }
   const outcome = await callNode({ scriptName: version.script_name, transport: version.transport, timeoutMs, headers: sentHeaders, body: JSON.stringify(envelope) });
   const verdict = judgeNodeOutcome(outcome);
   const stored = { request: json({ headers, body: envelope }), response: json(capped(outcome.kind === "response" ? { status: outcome.status, body: outcome.body } : { kind: outcome.kind })) };
@@ -696,7 +806,7 @@ export async function startAsyncAttempt(sql: Sql, env: AsyncEnv, runId: string, 
   // The token is derived from the attempt id, so a step that runs again makes the same one.
   const newId = uuidv7();
   const newToken = await derivedResourceToken(env.resourceTokenSecret, newId);
-  const tokenMs = plan.maxWaitMs + plan.timeoutMs + RESOURCE_TOKEN_GRACE_MS;
+  const tokenMs = plan.maxWaitMs + plan.timeoutMs + cacheKeyTimeoutMs(scope, version, plan.timeoutMs) + RESOURCE_TOKEN_GRACE_MS;
   await sql`
     with nr as (
       insert into node_runs (id, run_id, node_id, node_type, label, node_version_id, attempt_count, input)
@@ -715,6 +825,11 @@ export async function startAsyncAttempt(sql: Sql, env: AsyncEnv, runId: string, 
 
   const token = row.id === newId ? newToken : await derivedResourceToken(env.resourceTokenSecret, row.id);
   const headers = headersFor(runId, row.node_run_id, attempt);
+  const cached = await lookUpCache(sql, callNode, scope, version, input, row.node_run_id, attempt, { ...headers, "X-XAAS-Resource-Token": token.token }, plan.timeoutMs);
+  if (cached.kind === "hit") {
+    const done = await settleCacheHit(sql, scope, row.node_run_id, attempt, cached, json({ headers, path: "/cache-key", body: envelopeFor(scope, version, input) }));
+    return { kind: "ended", result: await afterNodeEnd(sql, scope, done.end, done.nodeOutput, options) };
+  }
   const body = envelopeFor(scope, version, input);
   if (plan.completion === "callback") {
     const exp = Math.floor((Date.now() + plan.maxWaitMs) / 1000) + CALLBACK_URL_GRACE_S;
