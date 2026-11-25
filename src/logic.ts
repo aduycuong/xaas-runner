@@ -100,6 +100,30 @@ export function judgePollOutcome(outcome: NodeOutcome): PollVerdict {
   return { kind: "ended", verdict: { ok: false, retryable: false, httpStatus: 200, error: { code: "INVALID_STATUS", message: 'The status route answered without a valid "status".' } } };
 }
 
+/** What a node answered to `POST /cache-key`: a key for its input, no key (do not cache this input), or a failure. */
+export type CacheKeyAnswer = { kind: "key"; key: string } | { kind: "none" } | { kind: "failed"; message: string };
+
+/** Reads the answer to `POST /cache-key`: `200 { key: string }`, or `{ key: null }` for an input the node does not cache. */
+export function readCacheKey(outcome: NodeOutcome, maxChars: number): CacheKeyAnswer {
+  if (outcome.kind !== "response") return { kind: "failed", message: outcome.kind === "timeout" ? "it did not answer in time" : outcome.message };
+  const { status, body } = outcome;
+  if (status < 200 || status >= 300) {
+    const reported = isRecord(body) && isRecord(body.error) && typeof body.error.message === "string" ? `: ${body.error.message}` : "";
+    return { kind: "failed", message: `it answered ${status}${reported}` };
+  }
+  if (!isRecord(body) || !("key" in body)) return { kind: "failed", message: 'it answered without a "key"' };
+  if (body.key === null) return { kind: "none" };
+  if (typeof body.key !== "string" || body.key.length === 0) return { kind: "failed", message: '"key" is not a non-empty string' };
+  if (body.key.length > maxChars) return { kind: "failed", message: `"key" is longer than ${maxChars} characters` };
+  return { kind: "key", key: body.key };
+}
+
+/** sha256 (hex) of a cache key: what `node_runs.cache_key` and `node_cache.key` hold. */
+export async function hashCacheKey(key: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 /** Milliseconds before attempt `attempt + 1`, after attempt `attempt` failed (the same as the Upstash `retryDelay` of sync nodes). */
 export function retryDelayMs(backoff: string, baseDelayMs: number, attempt: number): number {
   if (backoff === "linear") return baseDelayMs * attempt;
