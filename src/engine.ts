@@ -275,16 +275,17 @@ function capped(value: unknown): unknown {
 // Built-in nodes and skipped nodes
 // ---------------------------------------------------------------------------
 
-type Written = { id: string; type: string; label: string | null; status: NodeStatus; output?: unknown };
+/** `error`: why a node failed before its Worker was called (an input expression, an unknown version); kept when absent. */
+type Written = { id: string; type: string; label: string | null; status: NodeStatus; output?: unknown; error?: StoredError };
 
 /** Inserts or updates node runs that did not call a node Worker: if / switch / merge, skipped, cancelled. */
 function writeNodeRuns(sql: Sql, runId: string, rows: Written[]) {
   return rows.map(
     (row) => sql`
-      insert into node_runs (id, run_id, node_id, node_type, label, status, output, finished_at)
-      values (${uuidv7()}, ${runId}, ${row.id}, ${row.type}, ${row.label}, ${row.status}, ${row.output === undefined ? null : json(row.output)}::jsonb, now())
+      insert into node_runs (id, run_id, node_id, node_type, label, status, output, error, finished_at)
+      values (${uuidv7()}, ${runId}, ${row.id}, ${row.type}, ${row.label}, ${row.status}, ${row.output === undefined ? null : json(row.output)}::jsonb, ${row.error ? json(row.error) : null}::jsonb, now())
       on conflict (run_id, node_id) do update
-        set status = excluded.status, output = excluded.output, finished_at = now()`,
+        set status = excluded.status, output = excluded.output, error = coalesce(excluded.error, node_runs.error), finished_at = now()`,
   );
 }
 
@@ -631,7 +632,7 @@ async function prepareCall(sql: Sql, scope: ActionScope): Promise<Prepared> {
   const version = await loadVersion(sql, node);
   if (!version) {
     const failure = { code: "NODE_VERSION_NOT_FOUND", message: `Node "${nodeId}" uses ${node.data.nodeKey}@${node.data.version}, which is not registered.` };
-    await sql.transaction([...skipRows, ...writeNodeRuns(sql, runId, [{ id: nodeId, type: "action", label, status: "failed" }])]);
+    await sql.transaction([...skipRows, ...writeNodeRuns(sql, runId, [{ id: nodeId, type: "action", label, status: "failed", error: failure }])]);
     await failRunAt(sql, runId, null, failure);
     return { kind: "ended", result: { ends: [{ id: nodeId, status: "failed" }], finished: true, failed: failure } };
   }
@@ -641,7 +642,7 @@ async function prepareCall(sql: Sql, scope: ActionScope): Promise<Prepared> {
   } catch (error) {
     if (!(error instanceof ExpressionError)) throw error;
     const failure = { code: "EXPRESSION_ERROR", message: `Node "${nodeId}": ${error.message}` };
-    await sql.transaction([...skipRows, ...writeNodeRuns(sql, runId, [{ id: nodeId, type: "action", label, status: "failed" }])]);
+    await sql.transaction([...skipRows, ...writeNodeRuns(sql, runId, [{ id: nodeId, type: "action", label, status: "failed", error: failure }])]);
     return { kind: "ended", result: await finishAfterFailure(sql, runId, node, failure) };
   }
 }
@@ -978,7 +979,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 async function finishAfterFailure(sql: Sql, runId: string, node: ActionNode, error: StoredError, nodeRunId?: string): Promise<StepResult> {
   if (node.data.settings.onError === "continue") {
     // An expression error or similar before the node ran: continue with a null output.
-    await sql.transaction(writeNodeRuns(sql, runId, [{ id: node.id, type: "action", label: node.data.label ?? node.id, status: "warning", output: null }]));
+    await sql.transaction(writeNodeRuns(sql, runId, [{ id: node.id, type: "action", label: node.data.label ?? node.id, status: "warning", output: null, error }]));
     return { ends: [{ id: node.id, status: "warning" }], finished: false };
   }
   await failRunAt(sql, runId, nodeRunId ?? null, error);
