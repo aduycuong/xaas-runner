@@ -58,8 +58,8 @@ const settingsSchema = z
     maxAttempts: z.int().min(1).max(10).nullable().default(null),
     /** Async nodes: milliseconds from the 202 to the result; null inherits the node definition. Ignored for sync nodes. */
     maxWait: z.int().positive().nullable().default(null),
-    /** Seconds a run may reuse the output of an earlier run of this node with the same cache key; 0 does not cache. Nodes with manifest `cache` only. */
-    cacheTtl: z.int().min(0).default(0),
+    /** Seconds a run may reuse the output of an earlier run of this node with the same cache key; 0 does not cache, -1 keeps it forever. Nodes with manifest `cache` only. */
+    cacheTtl: z.int().min(-1).default(0),
   })
   .default({ onError: "stop", timeout: null, maxAttempts: null, maxWait: null, cacheTtl: 0 });
 

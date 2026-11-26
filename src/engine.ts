@@ -28,6 +28,7 @@ import {
 } from "./graph";
 import { CACHE_KEY_TIMEOUT_MS, clampToRange, MAX_ATTEMPTS, MAX_CACHE_KEY_CHARS, MAX_CACHE_TTL_S, MAX_WAIT_MS, POLL_ERRORS_IN_A_ROW, TIMEOUT_MS } from "./limits";
 import {
+  cacheWindow,
   hashCacheKey,
   judgeCallbackBody,
   judgeNodeOutcome,
@@ -481,10 +482,12 @@ async function settleAttempt(
 
 /**
  * Ends a node run that succeeded. When attempt 1 got a cache key (`node_runs.cache_key`), the output is also stored in
- * `node_cache` under it, for the workspace, node version and environment of the run, until the run's TTL is over.
+ * `node_cache` under it, for the workspace, node version and environment of the run, until the run's TTL is over
+ * (`expires_at = 'infinity'` when the node caches forever).
  */
 function succeedNodeRun(sql: Sql, scope: ActionScope, nodeRunId: string, status: NodeStatus, output: unknown, attempt: number): Query {
-  const ttl = Math.min(scope.node.data.settings.cacheTtl, MAX_CACHE_TTL_S);
+  const window = cacheWindow(scope.node.data.settings.cacheTtl, MAX_CACHE_TTL_S);
+  const seconds = window.on ? window.seconds : null;
   return sql`
     with nr as (
       update node_runs set status = ${status}, output = ${json(output)}::jsonb, attempt_count = ${attempt}, finished_at = now() where id = ${nodeRunId}
@@ -492,15 +495,15 @@ function succeedNodeRun(sql: Sql, scope: ActionScope, nodeRunId: string, status:
     )
     insert into node_cache (workspace_id, node_key, node_version, env, key, output, node_run_id, expires_at)
     select ${scope.run.workspace_id}::uuid, ${scope.node.data.nodeKey}, ${scope.node.data.version}, ${scope.run.env}, nr.cache_key, nr.output, nr.id,
-      now() + ${ttl}::float8 * interval '1 second'
-    from nr where nr.cache_key is not null and ${ttl}::float8 > 0
+      case when ${seconds}::float8 is null then 'infinity'::timestamptz else now() + ${seconds}::float8 * interval '1 second' end
+    from nr where nr.cache_key is not null and ${window.on}::boolean
     on conflict (workspace_id, node_key, node_version, env, key) do update
       set output = excluded.output, node_run_id = excluded.node_run_id, created_at = now(), expires_at = excluded.expires_at`;
 }
 
 /** How long attempt 1 of this node may spend on `POST /cache-key`; 0 when the node is not cached. */
 function cacheKeyTimeoutMs(scope: ActionScope, version: VersionRow, timeoutMs: number): number {
-  return version.cache && scope.node.data.settings.cacheTtl > 0 ? Math.min(timeoutMs, CACHE_KEY_TIMEOUT_MS) : 0;
+  return version.cache && cacheWindow(scope.node.data.settings.cacheTtl, MAX_CACHE_TTL_S).on ? Math.min(timeoutMs, CACHE_KEY_TIMEOUT_MS) : 0;
 }
 
 type CacheLookup = { kind: "hit"; key: string; output: unknown; storedAt: string } | { kind: "miss" };
@@ -540,12 +543,14 @@ async function lookUpCache(
     return { kind: "miss" };
   }
   const key = await hashCacheKey(answer.key);
-  const ttl = Math.min(node.data.settings.cacheTtl, MAX_CACHE_TTL_S);
+  const window = cacheWindow(node.data.settings.cacheTtl, MAX_CACHE_TTL_S);
+  // Forever (-1): any entry of this key; otherwise one younger than the TTL.
+  const seconds = window.on ? window.seconds : null;
   const [, found] = await sql.transaction([
     sql`update node_runs set cache_key = ${key} where id = ${nodeRunId}`,
     sql`select output, created_at from node_cache
         where workspace_id = ${run.workspace_id}::uuid and node_key = ${node.data.nodeKey} and node_version = ${node.data.version} and env = ${run.env} and key = ${key}
-          and created_at > now() - ${ttl}::float8 * interval '1 second'
+          and (${seconds}::float8 is null or created_at > now() - ${seconds}::float8 * interval '1 second')
         limit 1`,
   ]);
   const row = (found as unknown as { output: unknown; created_at: Date | string }[])[0];

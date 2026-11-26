@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bindingName, hashCacheKey, judgeNodeOutcome, readCacheKey, retryDelay } from "./logic";
+import { bindingName, cacheWindow, hashCacheKey, judgeNodeOutcome, readCacheKey, retryDelay } from "./logic";
+
+test("cache window: 0 is off, seconds are cut to the maximum, -1 is forever", () => {
+  assert.deepEqual(cacheWindow(0, 100), { on: false });
+  assert.deepEqual(cacheWindow(-2, 100), { on: false });
+  assert.deepEqual(cacheWindow(60, 100), { on: true, seconds: 60 });
+  assert.deepEqual(cacheWindow(500, 100), { on: true, seconds: 100 });
+  assert.deepEqual(cacheWindow(-1, 100), { on: true, seconds: null });
+});
 
 test("cache key: a non-empty string, null for an input the node does not cache, anything else fails", () => {
   const answer = (status: number, body: unknown) => readCacheKey({ kind: "response", status, body }, 20);
