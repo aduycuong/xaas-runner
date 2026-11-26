@@ -1,6 +1,7 @@
 // Pure helpers of the runner: no I/O, covered by logic.test.ts.
 
 import type { StoredError } from "./graph";
+import { CACHE_FOREVER } from "./limits";
 export type { StoredError };
 
 // ---------------------------------------------------------------------------
@@ -116,6 +117,16 @@ export function readCacheKey(outcome: NodeOutcome, maxChars: number): CacheKeyAn
   if (typeof body.key !== "string" || body.key.length === 0) return { kind: "failed", message: '"key" is not a non-empty string' };
   if (body.key.length > maxChars) return { kind: "failed", message: `"key" is longer than ${maxChars} characters` };
   return { kind: "key", key: body.key };
+}
+
+/**
+ * What a node's `cacheTtl` means: no cache (0, or anything below -1), a number of seconds (cut to `maxSeconds`), or
+ * forever (-1: `seconds` is null).
+ */
+export function cacheWindow(cacheTtl: number, maxSeconds: number): { on: false } | { on: true; seconds: number | null } {
+  if (cacheTtl === CACHE_FOREVER) return { on: true, seconds: null };
+  if (!(cacheTtl > 0)) return { on: false };
+  return { on: true, seconds: Math.min(cacheTtl, maxSeconds) };
 }
 
 /** sha256 (hex) of a cache key: what `node_runs.cache_key` and `node_cache.key` hold. */

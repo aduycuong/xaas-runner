@@ -15,6 +15,8 @@ export const POLL_ERRORS_IN_A_ROW = 3;
 
 /** Time the node has to answer `POST /cache-key` (at most its own timeout). */
 export const CACHE_KEY_TIMEOUT_MS = 10_000;
+/** `cacheTtl` that keeps a cached output forever: no age limit on reading, `expires_at = 'infinity'`. */
+export const CACHE_FOREVER = -1;
 /** A cache TTL longer than this is cut to it when the entry is stored (`expires_at` must stay a valid time). */
 export const MAX_CACHE_TTL_S = 100 * 365 * 86_400;
 /** A cache key longer than this is refused (the runner stores only its sha256). */
