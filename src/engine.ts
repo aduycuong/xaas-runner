@@ -70,7 +70,16 @@ const CALLBACK_URL_GRACE_S = 3600;
  * only what the code between steps needs.
  */
 export type RunPlan =
-  | { ok: true; graph: Graph; nodes: Record<string, PlanNode>; info: { workspaceId: string; workflowId: string; no: number; test: boolean } }
+  | {
+      ok: true;
+      graph: Graph;
+      nodes: Record<string, PlanNode>;
+      /**
+       * `reportsNodes`: someone follows which node the run is at (a status callback of level `nodes` that takes this run,
+       * or the URL the call named), so the runner reports each node it starts (`publishRunNode`). Read once, at load.
+       */
+      info: { workspaceId: string; workflowId: string; no: number; test: boolean; reportsNodes?: boolean };
+    }
   | { ok: false; error: StoredError };
 
 export type NodeCall = {
@@ -163,7 +172,12 @@ export async function loadRun(sql: Sql, runId: string): Promise<RunPlan> {
     ), logged as (
       insert into run_logs (id, run_id, level, message) select ${uuidv7()}::uuid, id, 'info', 'Run started' from started
     )
-    select wv.definition, r.test, r.workspace_id, r.workflow_id, r.no
+    select wv.definition, r.test, r.workspace_id, r.workflow_id, r.no,
+      (r.test is null and (
+        exists (select 1 from workflow_callbacks c where c.workflow_id = r.workflow_id and c.enabled and c.level = 'nodes'
+          and (c.only_authentication_id is null or c.only_authentication_id = r.authentication_id))
+        or exists (select 1 from run_deliveries d where d.run_id = r.id and d.callback_id is null)
+      )) as reports_nodes
     from runs r join workflow_versions wv on wv.id = r.workflow_version_id
     where r.id = ${runId}`;
   if (!run) return { ok: false, error: { code: "RUN_NOT_FOUND", message: `Run ${runId} does not exist.` } };
@@ -214,7 +228,7 @@ export async function loadRun(sql: Sql, runId: string): Promise<RunPlan> {
     }
     nodes[node.id] = { retries: Math.max(0, attempts - 1) + INFRA_RETRIES, retryDelay: retryDelay(version.retry_backoff, version.retry_base_delay_ms) };
   }
-  return { ok: true, graph, nodes, info: { workspaceId: run.workspace_id, workflowId: run.workflow_id, no: Number(run.no), test: run.test != null } };
+  return { ok: true, graph, nodes, info: { workspaceId: run.workspace_id, workflowId: run.workflow_id, no: Number(run.no), test: run.test != null, reportsNodes: Boolean(run.reports_nodes) } };
 }
 
 // ---------------------------------------------------------------------------
