@@ -15,7 +15,7 @@ import {
   type CallNode,
 } from "./engine";
 import { bindingName } from "./logic";
-import { publishRunFinished } from "./notify";
+import { publishRunFinished, publishRunNode } from "./notify";
 import { orchestrate } from "./orchestrate";
 import { createRealtime, runEvents, type RtdbEnv } from "./rtdb";
 import { createTiming } from "./timing";
@@ -142,6 +142,10 @@ app.post("/run/v4", async (c) => {
         // A test run starts nothing else: no queue to advance, no event trigger to fire.
         if (!plan.ok || !plan.info.test) c.executionCtx.waitUntil(publishRunFinished(c.env, runId));
       };
+      // A node starts (or an async node starts waiting): the status callbacks that follow nodes hear of it, at most every 5 s.
+      const nodeStarted = () => {
+        if (plan.ok && plan.info.reportsNodes) c.executionCtx.waitUntil(publishRunNode(c.env, runId));
+      };
       const skipped = (ids: string[]) => ids.forEach((id) => events?.nodeEnded(id, "skipped"));
       const ended = (ends: { id: string; status: string }[]) => ends.forEach((end) => events?.nodeEnded(end.id, end.status));
       /** Realtime updates once an async node's step ended it. */
@@ -157,6 +161,7 @@ app.post("/run/v4", async (c) => {
         step: (name, fn, settings) => context.run(name, () => timing.step(name, fn), settings),
         executeAction: async (nodeId, options) => {
           events?.nodeRunning(nodeId);
+          nodeStarted();
           skipped(options.skips);
           const result = await executeAction(sql, runId, nodeId, callNode, options);
           ended(result.ends);
@@ -183,6 +188,7 @@ app.post("/run/v4", async (c) => {
         startAsync: async (nodeId, attempt, asyncPlan, options) => {
           if (attempt === 1) {
             events?.nodeRunning(nodeId);
+            nodeStarted();
             skipped(options.skips);
           }
           return asyncEnded(await startAsyncAttempt(sql, asyncEnv(c.env), runId, nodeId, attempt, asyncPlan, callNode, options));
