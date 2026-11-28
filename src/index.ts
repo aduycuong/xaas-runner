@@ -14,6 +14,7 @@ import {
   type AsyncStep,
   type CallNode,
 } from "./engine";
+import { emitEvent, RUNNER_NODES } from "./emit-event";
 import { bindingName } from "./logic";
 import { publishRunFinished, publishRunNode } from "./notify";
 import { orchestrate } from "./orchestrate";
@@ -48,10 +49,15 @@ type NodeFetcher = { fetch: (input: string, init?: RequestInit) => Promise<Respo
 
 /**
  * The one place that decides how a node Worker is reached. Moving to a dispatch namespace
- * (Workers for Platforms) only changes this function.
+ * (Workers for Platforms) only changes this function. A node of transport `runner` has no Worker:
+ * the runner does its work here (`emit-event.ts`).
  */
 function createCallNode(env: Record<string, unknown>): CallNode {
   return async (call) => {
+    if (call.transport === "runner") {
+      if (call.scriptName === "runner-core-emit-event-v1-0-0" && (call.path ?? "/") === "/") return emitEvent(env as Bindings, call);
+      return { kind: "unavailable", message: `The runner does not know node "${call.scriptName}".` };
+    }
     const binding = call.transport === "service_binding" ? env[bindingName(call.scriptName)] : undefined;
     if (!binding || typeof (binding as NodeFetcher).fetch !== "function") {
       return { kind: "unavailable", message: `The runner has no ${call.transport} for node Worker "${call.scriptName}".` };
@@ -89,6 +95,8 @@ app.get("/nodes/:script/health", async (c) => {
   if (c.req.header("authorization") !== `Bearer ${token}`) return c.json({ error: "unauthorized" }, 401);
 
   const script = c.req.param("script");
+  // A node the runner does itself is healthy when the runner is.
+  if (RUNNER_NODES.has(script)) return c.json({ script, status: 200, health: { ok: true, runner: true } });
   const binding = (c.env as unknown as Record<string, unknown>)[bindingName(script)] as NodeFetcher | undefined;
   if (!binding || typeof binding.fetch !== "function") return c.json({ error: "node_not_bound", script }, 404);
 
