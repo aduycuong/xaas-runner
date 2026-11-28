@@ -1,0 +1,59 @@
+{
+  "key": "core.emit_event",
+  "version": "1.0.0",
+  "name": "Emit event",
+  "category": "Core",
+  "tags": ["event", "publish", "pubsub", "chain", "workflow"],
+  "description": "Emits a named event with a payload: every custom event trigger of the workspace listening to that name, in this run's environment, starts its workflow.",
+  "mode": "sync",
+  "timeout_ms": 30000,
+  "retry": { "max_attempts": 3, "backoff": "exponential", "base_delay_ms": 1000 },
+  "resources": [],
+  "cache": false,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "event": {
+        "type": "string",
+        "title": "Event name",
+        "description": "The name custom event triggers listen to, matched exactly: letters, digits and . _ : - (e.g. task.created).",
+        "minLength": 1,
+        "maxLength": 100,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+      },
+      "payload": {
+        "type": "object",
+        "title": "Payload",
+        "description": "What the started runs read as {{ trigger.body.payload }}. A JSON object, at most 256 KB.",
+        "additionalProperties": true,
+        "default": {}
+      }
+    },
+    "required": ["event"],
+    "additionalProperties": false
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "event": { "type": "string" },
+      "id": { "type": "string", "description": "Id of this emit; the started runs read it as {{ trigger.body.id }}." },
+      "env": { "type": "string" },
+      "started": { "type": "integer", "description": "Runs started or queued." },
+      "triggers": {
+        "type": "array",
+        "description": "Each trigger listening to the event: the run it started, or why it did not.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "trigger": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" } } },
+            "workflow": { "type": "object", "properties": { "id": { "type": "string" }, "slug": { "type": "string" }, "name": { "type": "string" } } },
+            "outcome": { "type": "string", "enum": ["fired", "rejected", "skipped"] },
+            "reason": { "type": ["string", "null"] },
+            "run": { "type": ["object", "null"], "properties": { "id": { "type": "string" }, "no": { "type": "integer" }, "queued": { "type": "boolean" } } }
+          }
+        }
+      }
+    },
+    "required": ["event", "id", "env", "started", "triggers"]
+  }
+}
